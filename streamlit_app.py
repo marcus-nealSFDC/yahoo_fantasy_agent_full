@@ -219,13 +219,56 @@ with st.sidebar:
             st.stop()
     else:
         st.success("Yahoo connected ✅")
+def fetch_nfl_leagues(sc):
+    """
+    Works across yfa versions that may or may not have:
+      - Game.current_game_id()
+      - Game.current_season()
+      - Game.leagues(season) vs leagues()
+      - Game.league_ids(season)
+    Returns: list[{"league_key": ..., "name": ...}] where possible.
+    """
+    gm = yfa.Game(sc, "nfl")
+
+    # Determine the season/game identifier we can pass
+    season = None
+    if hasattr(gm, "current_game_id"):
+        try: season = gm.current_game_id()
+        except Exception: season = None
+    if season is None and hasattr(gm, "current_season"):
+        try: season = gm.current_season()
+        except Exception: season = None
+    if season is None and hasattr(gm, "game_id"):
+        try: season = gm.game_id()
+        except Exception: season = None
+
+    # Try the most helpful, structured call first
+    leagues = []
+    if hasattr(gm, "leagues"):
+        try:
+            leagues = gm.leagues(season) if season is not None else gm.leagues()
+        except Exception:
+            try:
+                # some versions treat leagues() as parameterless only
+                leagues = gm.leagues()
+            except Exception:
+                pass
+
+    # Fallback to league_ids if leagues() isn’t available/usable
+    if not leagues and hasattr(gm, "league_ids"):
+        try:
+            ids = gm.league_ids(season) if season is not None else gm.league_ids()
+            leagues = [{"league_key": lid, "name": lid} for lid in ids]
+        except Exception:
+            pass
+
+    return leagues or []
+
 
 # ---------------- Live data: leagues ----------------
 try:
     sc = get_session()
-    gm = yfa.Game(sc, "nfl")
-    season = gm.current_game_id()
-    leagues = gm.leagues(season)
+    leagues = fetch_nfl_leagues(sc)
 except Exception as e:
     st.error(f"Init error: {e}")
     st.stop()
@@ -233,10 +276,6 @@ except Exception as e:
 if not leagues:
     st.warning("No NFL leagues found for this Yahoo account.")
     st.stop()
-
-league_map = {f"{lg['name']} ({lg['league_key']})": lg["league_key"] for lg in leagues}
-choice = st.selectbox("Select a league", list(league_map.keys()))
-league_key = league_map[choice]
 
 # ---------------- Tabs: Roster / Start-Sit / Waivers ----------------
 tab1, tab2, tab3 = st.tabs(["Roster", "Start/Sit (heuristic)", "Waivers (Add/Drop or FAAB)"])
