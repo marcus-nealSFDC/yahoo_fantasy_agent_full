@@ -1,4 +1,3 @@
-
 import os, json, time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -72,7 +71,8 @@ def save_tokens(payload: dict):
     }))
 
 def have_tokens() -> bool:
-    if not OAUTH_FILE.exists(): return False
+    if not OAUTH_FILE.exists():
+        return False
     try:
         d = json.loads(OAUTH_FILE.read_text())
         return bool(d.get("access_token") and d.get("refresh_token"))
@@ -87,12 +87,146 @@ def get_session() -> OAuth2:
         sc.refresh_access_token()
     return sc
 
+# ---------------- HTTP helper with diagnostics ----------------
+def yfs_get(sc, path):
+    """
+    GET Yahoo Fantasy v2 with strong diagnostics.
+    Example path: "/users;use_login=1/games/leagues?format=json"
+    """
+    url = "https://fantasysports.yahooapis.com/fantasy/v2" + path
+    r = sc.session.get(
+        url,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+
+    with st.expander(f"HTTP debug: {path}"):
+        st.write({"url": url, "status_code": r.status_code, "content_type": r.headers.get("Content-Type", "")})
+        st.code((r.text or "")[:800])
+
+    if r.status_code == 401:
+        raise RuntimeError("401 Unauthorized: token invalid/expired or scope missing. Click Connect again.")
+    if r.status_code == 403:
+        raise RuntimeError("403 Forbidden: app not authorized for Fantasy scope or account lacks access.")
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.status_code} error from Yahoo: {r.text[:200]}")
+
+    body = (r.text or "").strip()
+    if not body:
+        raise RuntimeError("Empty response from Yahoo (no body).")
+
+    try:
+        return r.json()
+    except Exception:
+        ct = r.headers.get("Content-Type", "")
+        raise RuntimeError(f"Non‑JSON response ({r.status_code}, {ct}). First 400 chars: {body[:400]}")
+
+# ---------------- Parsers for numeric-keyed Yahoo JSON ----------------
+def parse_games_leagues_v2(raw):
+    """
+    Parse Yahoo JSON with numeric keys + arrays (like your debug blob).
+    Returns:
+      games   = [{"game_key","game_code","season","name"}]
+      leagues = [{"game_key","league_key","name"}]
+    """
+    fc = (raw or {}).get("fantasy_content", {})
+    users = fc.get("users", {})
+
+    # Locate the user array
+    user_arr = None
+    if isinstance(users, dict):
+        if "user" in users:
+            user_arr = users["user"]
+        else:
+            for k, v in users.items():
+                if str(k).isdigit() and isinstance(v, dict) and "user" in v:
+                    user_arr = v["user"]
+                    break
+    if not user_arr:
+        return [], []
+
+    # Find "games" container in user array
+    games_container = None
+    for entry in user_arr:
+        if isinstance(entry, dict) and "games" in entry:
+            games_container = entry["games"]
+            break
+    if not games_container:
+        return [], []
+
+    games, leagues = [], []
+
+    # Each key "0","1",... → {"game": [ meta, {"leagues": {...}}, ... ]}
+    for _, game_wrapper in games_container.items():
+        if not isinstance(game_wrapper, dict):
+            continue
+        glist = game_wrapper.get("game")
+        if not isinstance(glist, list):
+            continue
+
+        # meta has code/season (or at least game_key)
+        gmeta = None
+        for elem in glist:
+            if isinstance(elem, dict) and ("code" in elem or "game_code" in elem) and "season" in elem:
+                gmeta = elem
+                break
+        if not gmeta:
+            for elem in glist:
+                if isinstance(elem, dict) and "game_key" in elem:
+                    gmeta = elem
+                    break
+        if not gmeta:
+            continue
+
+        gk = gmeta.get("game_key")
+        gc = gmeta.get("code") or gmeta.get("game_code")
+        season = gmeta.get("season")
+        gname = gmeta.get("name") or f"{gc} {season}"
+        games.append({"game_key": gk, "game_code": gc, "season": season, "name": gname})
+
+        # leagues for this game
+        for elem in glist:
+            if isinstance(elem, dict) and "leagues" in elem:
+                leagues_dict = elem["leagues"]
+                for _, lwrap in leagues_dict.items():
+                    if not isinstance(lwrap, dict):
+                        continue
+                    lst = lwrap.get("league")
+                    if isinstance(lst, list):
+                        for lentry in lst:
+                            if isinstance(lentry, dict):
+                                lk = lentry.get("league_key")
+                                nm = lentry.get("name") or lk
+                            elif isinstance(lentry, list):
+                                lk = nm = None
+                                for kv in lentry:
+                                    if "league_key" in kv: lk = kv["league_key"]
+                                    if "name" in kv: nm = kv["name"]
+                                nm = nm or lk
+                            else:
+                                continue
+                            if lk:
+                                leagues.append({"game_key": gk, "league_key": lk, "name": nm})
+    return games, leagues
+
+def filter_latest_nfl_leagues(leagues, games):
+    """Keep leagues belonging to the latest NFL (game_code='nfl') season."""
+    def to_int(s):
+        try: return int(str(s))
+        except: return -1
+    nfl_games = [g for g in games if (g.get("game_code") == "nfl" and g.get("season"))]
+    if not nfl_games:
+        return []
+    latest = max(nfl_games, key=lambda g: to_int(g["season"]))
+    latest_gk = latest["game_key"]
+    return [L for L in leagues if L.get("game_key") == latest_gk]
+
 # ---------------- Data helpers ----------------
 def resolve_team_key(sc, league_key: str):
     """
     Return the team_key for the logged-in user in the given league.
-    1) Try through yahoo_fantasy_api League.teams() (shape varies by version)
-    2) Fallback to Yahoo user-scoped teams endpoint and match by league_key prefix
+    1) Try yahoo_fantasy_api League.teams() (shape varies by version)
+    2) Fallback to user-scoped teams endpoint and match by league_key prefix
        (team_key looks like: "<game_key>.l.<league_id>.t.<team_id>")
     """
     L = yfa.League(sc, league_key)
@@ -179,7 +313,6 @@ def resolve_team_key(sc, league_key: str):
     return None
 
 def roster_df(sc, league_key: str) -> pd.DataFrame:
-    L = yfa.League(sc, league_key)
     team_key = resolve_team_key(sc, league_key)
     if not team_key:
         return pd.DataFrame()
@@ -199,7 +332,6 @@ def roster_df(sc, league_key: str) -> pd.DataFrame:
             "points": (p.get("points") if isinstance(p, dict) else 0) or (p.get("proj_points") if isinstance(p, dict) else 0) or 0,
         })
     return pd.DataFrame(rows)
-
 
 def free_agents(L: "yfa.League", positions=("WR","RB","TE","QB"), limit=30):
     fa = []
@@ -306,363 +438,6 @@ with st.sidebar:
             st.stop()
     else:
         st.success("Yahoo connected ✅")
-def fetch_nfl_leagues(sc):
-    """
-    Works across yfa versions that may or may not have:
-      - Game.current_game_id()
-      - Game.current_season()
-      - Game.leagues(season) vs leagues()
-      - Game.league_ids(season)
-    Returns: list[{"league_key": ..., "name": ...}] where possible.
-    """
-    gm = yfa.Game(sc, "nfl")
-
-    # Determine the season/game identifier we can pass
-    season = None
-    if hasattr(gm, "current_game_id"):
-        try: season = gm.current_game_id()
-        except Exception: season = None
-    if season is None and hasattr(gm, "current_season"):
-        try: season = gm.current_season()
-        except Exception: season = None
-    if season is None and hasattr(gm, "game_id"):
-        try: season = gm.game_id()
-        except Exception: season = None
-
-    # Try the most helpful, structured call first
-    leagues = []
-    if hasattr(gm, "leagues"):
-        try:
-            leagues = gm.leagues(season) if season is not None else gm.leagues()
-        except Exception:
-            try:
-                # some versions treat leagues() as parameterless only
-                leagues = gm.leagues()
-            except Exception:
-                pass
-
-    # Fallback to league_ids if leagues() isn’t available/usable
-    if not leagues and hasattr(gm, "league_ids"):
-        try:
-            ids = gm.league_ids(season) if season is not None else gm.league_ids()
-            leagues = [{"league_key": lid, "name": lid} for lid in ids]
-        except Exception:
-            pass
-
-    return leagues or []
-def fetch_nfl_leagues_user(sc):
-    """
-    Reliable, user-scoped fetch of leagues for the logged-in account.
-    Uses: /fantasy/v2/users;use_login=1/games;game_keys=nfl/leagues?format=json
-    Returns a list of dicts: [{"league_key": "...","name": "..."}]
-    """
-    import requests
-    url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys=nfl/leagues?format=json"
-    # yahoo_oauth.OAuth2 gives us an authorized requests.Session as sc.session
-    sess = sc.session
-    r = sess.get(url, timeout=30)
-    data = r.json()
-
-    # Walk the JSON safely and extract leagues
-    leagues_out = []
-    try:
-        # Structure (JSON): users.user[0].games.game[*].leagues.league[*]
-        users = data.get("fantasy_content", {}).get("users", {})
-        user = users.get("user", [None])[0] or {}
-        games = (user.get("games", {}) or {}).get("game", []) or []
-        for g in games:
-            leagues = (g.get("leagues", {}) or {}).get("league", []) or []
-            for entry in leagues:
-                # each entry may be dict or [ { "league_key": ... }, { "name": ... }, ... ]
-                if isinstance(entry, dict):
-                    lk = entry.get("league_key")
-                    nm = entry.get("name") or lk
-                elif isinstance(entry, list):
-                    # list of one-key dicts
-                    lk = None; nm = None
-                    for kv in entry:
-                        if "league_key" in kv: lk = kv["league_key"]
-                        if "name" in kv: nm = kv["name"]
-                    if nm is None: nm = lk
-                else:
-                    continue
-                if lk:
-                    leagues_out.append({"league_key": lk, "name": nm})
-    except Exception:
-        pass
-    return leagues_out
-
-def yfs_get(sc, path):
-    """
-    GET helper against Yahoo Fantasy Sports v2 API, returning parsed JSON.
-    `path` like: "/users;use_login=1/games;game_keys=nfl/leagues?format=json"
-    """
-    url = "https://fantasysports.yahooapis.com/fantasy/v2" + path
-    r = sc.session.get(url, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def fetch_user_games_and_leagues(sc):
-    """
-    Fetch ALL games & leagues for the logged-in user (no pre-filter),
-    then we can filter for NFL ('nfl') after we confirm data exists.
-    """
-    data = yfs_get(sc, "/users;use_login=1/games/leagues?format=json")
-    return data  # raw; we’ll parse below
-
-def parse_games_leagues(raw):
-    """
-    Parse the Yahoo Fantasy JSON into:
-      - games: list of {"game_key","game_code","season","name"}
-      - leagues: list of {"game_key","league_key","name"}
-    Works across typical nested shapes.
-    """
-    fc = (raw or {}).get("fantasy_content", {})
-    users = fc.get("users", {})
-    user = (users.get("user") or [None])[0] or {}
-    games = (user.get("games") or {}).get("game") or []
-
-    out_games, out_leagues = [], []
-    for g in games:
-        # Each game is a dict with meta entries AND (optionally) "leagues"
-        gk = g.get("game_key") or (g.get("game") if isinstance(g.get("game"), str) else None)
-        gc = g.get("code") or g.get("game_code")
-        season = g.get("season")
-        gname = g.get("name") or f"{gc} {season}"
-        out_games.append({"game_key": gk, "game_code": gc, "season": season, "name": gname})
-
-        leags = (g.get("leagues") or {}).get("league") or []
-        for entry in leags:
-            if isinstance(entry, dict):
-                lk = entry.get("league_key"); nm = entry.get("name") or lk
-            elif isinstance(entry, list):
-                lk, nm = None, None
-                for kv in entry:
-                    if "league_key" in kv: lk = kv["league_key"]
-                    if "name" in kv: nm = kv["name"]
-                nm = nm or lk
-            else:
-                continue
-            if lk:
-                out_leagues.append({"game_key": gk, "league_key": lk, "name": nm})
-
-    return out_games, out_leagues
-
-def nfl_leagues_only(leagues, games):
-    """
-    Keep leagues whose parent game_code == 'nfl'.
-    We map game_key -> game_code via the games list.
-    """
-    code_by_gk = {g["game_key"]: g.get("game_code") for g in games if g.get("game_key")}
-    return [L for L in leagues if code_by_gk.get(L.get("game_key")) == "nfl"]
-def parse_games_leagues_v2(raw):
-    """
-    Parse Yahoo Fantasy JSON like the one you pasted (numeric keys + arrays).
-    Returns:
-      games   = [{"game_key","game_code","season","name"}]
-      leagues = [{"game_key","league_key","name"}]
-    """
-    fc = (raw or {}).get("fantasy_content", {})
-    users = fc.get("users", {})
-
-    # Get the user array e.g. users["user"] or users["0"]["user"]
-    user_arr = None
-    if isinstance(users, dict):
-        if "user" in users:
-            user_arr = users["user"]
-        else:
-            for k, v in users.items():
-                if str(k).isdigit() and isinstance(v, dict) and "user" in v:
-                    user_arr = v["user"]
-                    break
-    if not user_arr:
-        return [], []
-
-    # Find the "games" container inside the user array
-    games_container = None
-    for entry in user_arr:
-        if isinstance(entry, dict) and "games" in entry:
-            games_container = entry["games"]
-            break
-    if not games_container:
-        return [], []
-
-    games, leagues = [], []
-
-    # Walk each game wrapper: keys "0","1",... each has {"game": [ meta, {"leagues": {...}}, ... ]}
-    for _, game_wrapper in games_container.items():
-        if not isinstance(game_wrapper, dict):
-            continue
-        glist = game_wrapper.get("game")
-        if not isinstance(glist, list):
-            continue
-
-        # Find meta for the game (has code/season)
-        gmeta = None
-        for elem in glist:
-            if isinstance(elem, dict) and ("code" in elem or "game_code" in elem) and "season" in elem:
-                gmeta = elem
-                break
-        if not gmeta:
-            for elem in glist:
-                if isinstance(elem, dict) and "game_key" in elem:
-                    gmeta = elem
-                    break
-        if not gmeta:
-            continue
-
-        gk = gmeta.get("game_key")
-        gc = gmeta.get("code") or gmeta.get("game_code")
-        season = gmeta.get("season")
-        gname = gmeta.get("name") or f"{gc} {season}"
-        games.append({"game_key": gk, "game_code": gc, "season": season, "name": gname})
-
-        # Extract leagues for this game
-        for elem in glist:
-            if isinstance(elem, dict) and "leagues" in elem:
-                leagues_dict = elem["leagues"]
-                for _, lwrap in leagues_dict.items():
-                    if not isinstance(lwrap, dict):
-                        continue
-                    lst = lwrap.get("league")
-                    if isinstance(lst, list):
-                        for lentry in lst:
-                            if isinstance(lentry, dict):
-                                lk = lentry.get("league_key")
-                                nm = lentry.get("name") or lk
-                            elif isinstance(lentry, list):
-                                lk = nm = None
-                                for kv in lentry:
-                                    if "league_key" in kv: lk = kv["league_key"]
-                                    if "name" in kv: nm = kv["name"]
-                                nm = nm or lk
-                            else:
-                                continue
-                            if lk:
-                                leagues.append({"game_key": gk, "league_key": lk, "name": nm})
-    return games, leagues
-
-
-def filter_latest_nfl_leagues(leagues, games):
-    """
-    Keep leagues for the latest NFL season present (e.g., 2025 -> game_key 461).
-    """
-    nfl_games = [g for g in games if (g.get("game_code") == "nfl" and g.get("season"))]
-    if not nfl_games:
-        return []
-    # find max season numerically
-    def to_int(s):
-        try: return int(str(s))
-        except: return -1
-    latest = max(nfl_games, key=lambda g: to_int(g["season"]))
-    latest_gk = latest["game_key"]
-    return [L for L in leagues if L.get("game_key") == latest_gk]
-def yfs_get(sc, path):
-    """GET against Yahoo Fantasy Sports v2 and return JSON."""
-    url = "https://fantasysports.yahooapis.com/fantasy/v2" + path
-    r = sc.session.get(url, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def parse_games_leagues_v2(raw):
-    """
-    Parse Yahoo JSON with numeric keys + arrays (exactly like your debug blob).
-    Returns:
-      games   = [{"game_key","game_code","season","name"}]
-      leagues = [{"game_key","league_key","name"}]
-    """
-    fc = (raw or {}).get("fantasy_content", {})
-    users = fc.get("users", {})
-
-    # Locate the user array
-    user_arr = None
-    if isinstance(users, dict):
-        if "user" in users:
-            user_arr = users["user"]
-        else:
-            for k, v in users.items():
-                if str(k).isdigit() and isinstance(v, dict) and "user" in v:
-                    user_arr = v["user"]
-                    break
-    if not user_arr:
-        return [], []
-
-    # Find "games" container in user array
-    games_container = None
-    for entry in user_arr:
-        if isinstance(entry, dict) and "games" in entry:
-            games_container = entry["games"]
-            break
-    if not games_container:
-        return [], []
-
-    games, leagues = [], []
-
-    # Each key "0","1",... → {"game": [ meta, {"leagues": {...}}, ... ]}
-    for _, game_wrapper in games_container.items():
-        if not isinstance(game_wrapper, dict):
-            continue
-        glist = game_wrapper.get("game")
-        if not isinstance(glist, list):
-            continue
-
-        # meta has code/season (or at least game_key)
-        gmeta = None
-        for elem in glist:
-            if isinstance(elem, dict) and ("code" in elem or "game_code" in elem) and "season" in elem:
-                gmeta = elem
-                break
-        if not gmeta:
-            for elem in glist:
-                if isinstance(elem, dict) and "game_key" in elem:
-                    gmeta = elem
-                    break
-        if not gmeta:
-            continue
-
-        gk = gmeta.get("game_key")
-        gc = gmeta.get("code") or gmeta.get("game_code")
-        season = gmeta.get("season")
-        gname = gmeta.get("name") or f"{gc} {season}"
-        games.append({"game_key": gk, "game_code": gc, "season": season, "name": gname})
-
-        # leagues for this game
-        for elem in glist:
-            if isinstance(elem, dict) and "leagues" in elem:
-                leagues_dict = elem["leagues"]
-                for _, lwrap in leagues_dict.items():
-                    if not isinstance(lwrap, dict):
-                        continue
-                    lst = lwrap.get("league")
-                    if isinstance(lst, list):
-                        for lentry in lst:
-                            if isinstance(lentry, dict):
-                                lk = lentry.get("league_key")
-                                nm = lentry.get("name") or lk
-                            elif isinstance(lentry, list):
-                                lk = nm = None
-                                for kv in lentry:
-                                    if "league_key" in kv: lk = kv["league_key"]
-                                    if "name" in kv: nm = kv["name"]
-                                nm = nm or lk
-                            else:
-                                continue
-                            if lk:
-                                leagues.append({"game_key": gk, "league_key": lk, "name": nm})
-    return games, leagues
-
-def filter_latest_nfl_leagues(leagues, games):
-    """Keep leagues belonging to the latest NFL (game_code='nfl') season."""
-    def to_int(s):
-        try: return int(str(s))
-        except: return -1
-    nfl_games = [g for g in games if (g.get("game_code") == "nfl" and g.get("season"))]
-    if not nfl_games:
-        return []
-    latest = max(nfl_games, key=lambda g: to_int(g["season"]))
-    latest_gk = latest["game_key"]
-    return [L for L in leagues if L.get("game_key") == latest_gk]
-
 
 # ---------------- Live data: leagues ----------------
 try:
@@ -671,7 +446,7 @@ try:
     games, leagues_all = parse_games_leagues_v2(raw)
     nfl_leags = filter_latest_nfl_leagues(leagues_all, games)
 except Exception as e:
-    st.error(f"Init error: {e}")
+    st.error(f"Init error while loading leagues: {e}")
     st.stop()
 
 with st.expander("Debug: parsed games"):
@@ -689,10 +464,6 @@ if not nfl_leags:
 league_map = {f"{lg['name']} ({lg['league_key']})": lg["league_key"] for lg in nfl_leags}
 choice = st.selectbox("Select a league", list(league_map.keys()))
 league_key = league_map[choice]
-
-
-
-
 
 # ---------------- Tabs: Roster / Start-Sit / Waivers ----------------
 tab1, tab2, tab3 = st.tabs(["Roster", "Start/Sit (heuristic)", "Waivers (Add/Drop or FAAB)"])
@@ -812,3 +583,4 @@ with tab3:
                     st.json(result)
             except Exception as e:
                 st.error(f"Execution error: {e}")
+
