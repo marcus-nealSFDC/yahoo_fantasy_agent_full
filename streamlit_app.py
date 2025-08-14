@@ -412,12 +412,51 @@ league_map = {f"{lg['name']} ({lg['league_key']})": lg["league_key"] for lg in n
 choice = st.selectbox("Select a league", list(league_map.keys()))
 league_key = league_map[choice]
 
-# ─────────────── League status + pre‑draft gate ───────────────
-L_for_status = yfa.League(sc, league_key)
-settings = L_for_status.settings() or {}
-draft_status = settings.get("draft_status", "unknown")
+# ─────────────── League status + pre‑draft gate (robust) ───────────────
+def get_league_settings_safe(sc, league_key: str) -> dict:
+    """Robust settings fetch (library first, then raw API)."""
+    # 1) Library
+    try:
+        s = yfa.League(sc, league_key).settings() or {}
+        if isinstance(s, list):
+            flat = {}
+            for it in s:
+                if isinstance(it, dict):
+                    flat.update(it)
+            s = flat
+        return s
+    except Exception:
+        pass
+    # 2) Raw API
+    try:
+        raw_settings = yfs_get(sc, f"/league/{league_key}/settings?format=json")
+        fc = (raw_settings or {}).get("fantasy_content", {})
+        league = fc.get("league")
+        if isinstance(league, list):
+            for el in league:
+                if isinstance(el, dict) and "settings" in el:
+                    return el["settings"] or {}
+        if isinstance(league, dict) and "settings" in league:
+            return league["settings"] or {}
+    except Exception:
+        pass
+    return {}
 
-with st.expander("League status"):
+def coerce_draft_status(val) -> str:
+    v = str(val or "unknown").lower()
+    if "pre" in v:  return "predraft"
+    if "post" in v: return "postdraft"
+    if v in ("predraft","postdraft","inseason"): return v
+    return "unknown"
+
+settings = get_league_settings_safe(sc, league_key)
+draft_status = coerce_draft_status(settings.get("draft_status"))
+
+# BIG visible status line
+badge = {"predraft":"🟡", "postdraft":"🟢", "inseason":"🟢", "unknown":"⚠️"}.get(draft_status, "⚠️")
+st.markdown(f"### League status: {badge} **{draft_status}**")
+
+with st.expander("League info"):
     st.write({
         "league_key": league_key,
         "name": settings.get("name"),
@@ -429,290 +468,324 @@ with st.expander("League status"):
         "faab_budget": settings.get("faab_budget"),
     })
 
-# We always show Draft Assistant.
-# Other tabs appear only when league is postdraft (rosters exist).
-postdraft = (str(draft_status).lower() == "postdraft")
-if postdraft:
-    tabs = st.tabs(["Draft Assistant", "Roster", "Start/Sit", "Waivers", "Trades", "Scheduler"])
-else:
-    st.info("📝 This league is **pre‑draft**. Roster, Start/Sit, Waivers, and Trades unlock after your draft.")
-    tabs = st.tabs(["Draft Assistant"])
-
-# ───────────────────── Draft Assistant ─────────────────────
-with tabs[0]:
-    st.subheader("Draft Assistant")
-    st.caption("Upload projections/ADP to power tiers. CSV columns: name, position, team, proj_points (required). Optional: adp, ecr.")
-    uploaded = st.file_uploader("Upload projections CSV", type=["csv"])
-    if uploaded:
+# PRE‑DRAFT → show only Draft Assistant and STOP
+if draft_status != "postdraft":
+    st.info("📝 **Pre‑draft** detected. Roster, Start/Sit, Waivers, Trades, and Scheduler unlock after your draft.")
+    st.subheader("Draft Assistant (Pre‑draft)")
+    st.caption("Upload projections/ADP CSV. Required: `name`, `position`, `proj_points`. Optional: `team`, `adp`, `ecr`.")
+    uploaded_predraft = st.file_uploader("Upload projections CSV", type=["csv"], key="draft_upload_predraft")
+    if uploaded_predraft:
         try:
-            proj = pd.read_csv(uploaded)
-            # normalize columns
+            proj = pd.read_csv(uploaded_predraft)
             cols = {c.lower().strip(): c for c in proj.columns}
-            needed = ["name","position","proj_points"]
-            if not all(k in cols for k in needed):
-                st.error(f"CSV must include: {needed}. Found: {list(proj.columns)}")
+            need = ["name","position","proj_points"]
+            if not all(k in cols for k in need):
+                st.error(f"CSV must include: {need}. Found: {list(proj.columns)}")
             else:
-                dfp = proj.rename(columns={cols["name"]:"name",
-                                           cols["position"]:"position",
-                                           cols["proj_points"]:"proj_points"})
+                dfp = proj.rename(columns={
+                    cols["name"]:"name",
+                    cols["position"]:"position",
+                    cols["proj_points"]:"proj_points"
+                })
                 for opt in ("adp","ecr","team"):
-                    if opt in cols: dfp[opt] = proj[cols[opt]]
-                # build tiers per position by projection quantiles
+                    if opt in cols:
+                        dfp[opt] = proj[cols[opt]]
+
                 tiers = []
                 for pos, grp in dfp.groupby(dfp["position"].str.upper()):
                     g = grp.copy()
-                    q = g["proj_points"].rank(ascending=False, method="first")
-                    # simple tier cut: T1 top 12/8/6 by pos
-                    size = len(g)
-                    top = 12 if pos in ("WR","RB") else 6 if pos in ("QB","TE") else max(4, size//5)
-                    t1 = set(g.sort_values("proj_points", ascending=False).head(top).index)
-                    t2 = set(g.sort_values("proj_points", ascending=False).iloc[top:top*2].index)
-                    lab = []
-                    for i, row in g.iterrows():
-                        if i in t1: lab.append("T1")
-                        elif i in t2: lab.append("T2")
-                        else: lab.append("T3+")
-                    g = g.assign(tier=lab)
-                    tiers.append(g)
-                tiers_df = pd.concat(tiers).sort_values(["position","tier","proj_points"], ascending=[True, True, False])
+                    top = 12 if pos in ("WR","RB") else 6 if pos in ("QB","TE") else max(4, len(g)//5)
+                    top_sorted = g.sort_values("proj_points", ascending=False)
+                    t1 = set(top_sorted.head(top).index)
+                    t2 = set(top_sorted.iloc[top:top*2].index)
+                    labels = []
+                    for i in g.index:
+                        labels.append("T1" if i in t1 else "T2" if i in t2 else "T3+")
+                    tiers.append(g.assign(tier=labels))
+                tiers_df = pd.concat(tiers).sort_values(
+                    ["position","tier","proj_points"], ascending=[True, True, False]
+                )
                 st.dataframe(tiers_df.reset_index(drop=True), use_container_width=True)
-                st.caption("Heuristic tiers. You can sort/filter to build your queue.")
+                st.caption("Heuristic tiers. Sort/filter to build your queue.")
         except Exception as e:
             st.error(f"Could not read CSV: {e}")
     else:
-        st.info("Upload a projections CSV to populate tiers (you can export from any site you use).")
+        st.info("Tip: export projections from your favorite site and upload here.")
+    st.stop()  # hide everything else until postdraft
+
+# POSTDRAFT → show full tabs
+tabs = st.tabs(["Draft Assistant", "Roster", "Start/Sit", "Waivers", "Trades", "Scheduler"])
+
+# ───────────────────── Draft Assistant (postdraft tab) ─────────────────────
+with tabs[0]:
+    st.subheader("Draft Assistant")
+    uploaded = st.file_uploader("Upload projections CSV", type=["csv"], key="draft_upload_post")
+    if uploaded:
+        try:
+            proj = pd.read_csv(uploaded)
+            cols = {c.lower().strip(): c for c in proj.columns}
+            need = ["name","position","proj_points"]
+            if not all(k in cols for k in need):
+                st.error(f"CSV must include: {need}. Found: {list(proj.columns)}")
+            else:
+                dfp = proj.rename(columns={
+                    cols["name"]:"name",
+                    cols["position"]:"position",
+                    cols["proj_points"]:"proj_points"
+                })
+                for opt in ("adp","ecr","team"):
+                    if opt in cols:
+                        dfp[opt] = proj[cols[opt]]
+                tiers = []
+                for pos, grp in dfp.groupby(dfp["position"].str.upper()):
+                    g = grp.copy()
+                    top = 12 if pos in ("WR","RB") else 6 if pos in ("QB","TE") else max(4, len(g)//5)
+                    top_sorted = g.sort_values("proj_points", ascending=False)
+                    t1 = set(top_sorted.head(top).index)
+                    t2 = set(top_sorted.iloc[top:top*2].index)
+                    labels = []
+                    for i in g.index:
+                        labels.append("T1" if i in t1 else "T2" if i in t2 else "T3+")
+                    tiers.append(g.assign(tier=labels))
+                tiers_df = pd.concat(tiers).sort_values(
+                    ["position","tier","proj_points"], ascending=[True, True, False]
+                )
+                st.dataframe(tiers_df.reset_index(drop=True), use_container_width=True)
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+    else:
+        st.caption("Upload projections/ADP to populate tiers.")
 
 # ───────────────── Post‑draft tabs ─────────────────
-if postdraft:
-    # 1) Roster
-    with tabs[1]:
-        st.subheader("Current Roster")
-        df_roster = roster_df(sc, league_key)
-        st.dataframe(df_roster, use_container_width=True)
+# 1) Roster
+with tabs[1]:
+    st.subheader("Current Roster")
+    df_roster = roster_df(sc, league_key)
+    st.dataframe(df_roster, use_container_width=True)
 
-    # 2) Start/Sit
-    with tabs[2]:
-        st.subheader("Recommended Starters (simple heuristic)")
-        settings_full = settings or league_settings(sc, league_key)
+# 2) Start/Sit
+with tabs[2]:
+    st.subheader("Recommended Starters (simple heuristic)")
+    settings_full = settings or league_settings(sc, league_key)
 
-        # lineup slots
-        slots = []
-        for rp in settings_full.get("roster_positions", []):
-            pos, cnt = rp.get("position"), int(rp.get("count", 0))
-            if pos and cnt > 0:
-                slots += [pos]*cnt
+    # lineup slots
+    slots = []
+    for rp in settings_full.get("roster_positions", []):
+        pos, cnt = rp.get("position"), int(rp.get("count", 0))
+        if pos and cnt > 0:
+            slots += [pos]*cnt
 
-        def score_row(row):
-            status = (row["status"] or "").upper()
-            penalty = {"IR": -100, "O": -50, "D": -25, "Q": -10}.get(status, 0)
-            return float(row.get("points", 0) or 0) + penalty + 10
+    def score_row(row):
+        status = (row["status"] or "").upper()
+        penalty = {"IR": -100, "O": -50, "D": -25, "Q": -10}.get(status, 0)
+        return float(row.get("points", 0) or 0) + penalty + 10
 
-        pool = roster_df(sc, league_key)
-        if pool.empty:
-            st.info("No roster found (Yahoo may still be finalizing teams).")
-        else:
-            pool["score"] = pool.apply(score_row, axis=1)
+    pool = roster_df(sc, league_key)
+    if pool.empty:
+        st.info("No roster found (Yahoo may still be finalizing teams).")
+    else:
+        pool["score"] = pool.apply(score_row, axis=1)
 
-            def eligible(row, slot):
-                slot = slot.upper()
-                elig = (row["eligible_positions"] or "").upper().split(",")
-                if slot in ("W/R/T","WR/RB/TE","FLEX"): return any(p in elig for p in ("WR","RB","TE"))
-                if slot in ("D","DEF","DST"): return "DEF" in elig
-                return slot in elig
+        def eligible(row, slot):
+            slot = slot.upper()
+            elig = (row["eligible_positions"] or "").upper().split(",")
+            if slot in ("W/R/T","WR/RB/TE","FLEX"): return any(p in elig for p in ("WR","RB","TE"))
+            if slot in ("D","DEF","DST"): return "DEF" in elig
+            return slot in elig
 
-            starters, used = [], set()
-            for slot in slots:
-                elig_pool = pool[~pool["player_id"].isin(used)]
-                elig_pool = elig_pool[elig_pool.apply(lambda r: eligible(r, slot), axis=1)]
-                if not len(elig_pool): continue
-                pick = elig_pool.sort_values("score", ascending=False).iloc[0]
-                starters.append((slot, pick))
-                used.add(pick["player_id"])
-            bench = pool[~pool["player_id"].isin(used)].sort_values("score", ascending=False)
+        starters, used = [], set()
+        for slot in slots:
+            elig_pool = pool[~pool["player_id"].isin(used)]
+            elig_pool = elig_pool[elig_pool.apply(lambda r: eligible(r, slot), axis=1)]
+            if not len(elig_pool): continue
+            pick = elig_pool.sort_values("score", ascending=False).iloc[0]
+            starters.append((slot, pick))
+            used.add(pick["player_id"])
+        bench = pool[~pool["player_id"].isin(used)].sort_values("score", ascending=False)
 
-            st.write("### Starters")
-            for slot, p in starters:
-                st.write(f"- **{slot}** → {p['name']} (score: {p['score']:.1f}, status: {p['status']})")
+        st.write("### Starters")
+        for slot, p in starters:
+            st.write(f"- **{slot}** → {p['name']} (score: {p['score']:.1f}, status: {p['status']})")
 
-            st.write("### Bench (top 10)")
-            for _, p in bench.head(10).iterrows():
-                st.write(f"- {p['name']} (score: {p['score']:.1f}, status: {p['status']})")
+        st.write("### Bench (top 10)")
+        for _, p in bench.head(10).iterrows():
+            st.write(f"- {p['name']} (score: {p['score']:.1f}, status: {p['status']})")
 
-            if OPENAI_OK and st.button("Explain lineup (OpenAI)"):
-                try:
-                    roster_summary = "\n".join([f"{slot}: {p['name']} ({p['score']:.1f})" for slot, p in starters])
-                    bench_summary = "\n".join([f"{r['name']} ({r['score']:.1f})" for _, r in bench.head(5).iterrows()])
-                    resp = OPENAI_CLIENT.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {"role":"system","content":"You are a fantasy football assistant. Be concise."},
-                            {"role":"user","content": f"Starters:\n{roster_summary}\nBench (top 5):\n{bench_summary}"}
-                        ],
-                        max_tokens=250, temperature=0.2
-                    )
-                    st.info(resp.choices[0].message.content.strip())
-                except Exception as e:
-                    st.warning(f"OpenAI explanation not available: {e}")
-
-    # 3) Waivers
-    with tabs[3]:
-        st.subheader("Waiver targets & Approvals")
-        try:
-            L = yfa.League(sc, league_key)
-            cands = free_agents(L)
-        except Exception as e:
-            st.error(f"Failed to get free agents: {e}")
-            cands = []
-
-        team_df = roster_df(sc, league_key)
-
-        def positional_needs(roster_df: pd.DataFrame):
-            need = {"QB":0,"RB":0,"WR":0,"TE":0,"DEF":0}
-            for _, r in roster_df.iterrows():
-                for p in str(r.get("eligible_positions","")).split(","):
-                    p = p.strip().upper()
-                    if p in need: need[p] += 1
-            return need
-
-        def suggest_faab(points_gain, budget=100, aggression=0.15):
-            # very simple: value 0–1 → FAAB percent
-            scale = min(max(points_gain/20.0, 0), 1)  # assume 20 pts = max impact
-            return int(round(budget * (aggression * scale)))
-
-        if not cands:
-            st.info("No candidates returned right now.")
-        else:
-            st.write("### Suggested priorities")
-            needs = positional_needs(team_df) if not team_df.empty else {}
-            faab_budget = settings.get("faab_budget") or 100
-            shown = []
-            for c in cands:
-                need_boost = 4 if needs.get(c["position"], 0) <= 1 else 0
-                score = (c["points"] or 0) + need_boost
-                bid = suggest_faab(points_gain=c["points"] or 0, budget=faab_budget)
-                shown.append({"name": c["name"], "pos": c["position"], "points": c["points"], "score": score, "suggested_faab": bid, "player_id": c["player_id"]})
-            dfw = pd.DataFrame(shown).sort_values("score", ascending=False)
-            st.dataframe(dfw, use_container_width=True)
-
-            st.divider()
-            st.write("### Approve & Execute")
-            if not dfw.empty:
-                idx = st.number_input("Row to add (0‑based from table above)", min_value=0, max_value=len(dfw)-1, value=0)
-                pick = dfw.iloc[int(idx)]
-                drop_pid = st.text_input("Player ID to drop (optional)")
-                faab_bid = st.number_input("FAAB bid (optional)", min_value=0, max_value=300, value=int(pick["suggested_faab"]))
-                if st.button("Approve transaction"):
-                    try:
-                        result = execute_add_drop(sc, league_key, add_pid=str(pick["player_id"]),
-                                                  drop_pid=drop_pid or None,
-                                                  faab_bid=int(faab_bid) if faab_bid else None)
-                        if result.get("status") == "ok":
-                            st.success("Transaction submitted ✅")
-                            st.json(result.get("details"))
-                        else:
-                            st.error("Transaction failed"); st.json(result)
-                    except Exception as e:
-                        st.error(f"Execution error: {e}")
-
-    # 4) Trades (Evaluator)
-    with tabs[4]:
-        st.subheader("Trade Evaluator")
-        st.caption("Pick players to offer/request. We estimate value using current points/projections. For better accuracy, upload projections in Draft Assistant.")
-        # Build league rosters
-        league = yfa.League(sc, league_key)
-        team_key_you = resolve_team_key(sc, league_key)
-        teams = []
-        try:
-            for t in league.teams():
-                tk = None; name = None
-                if isinstance(t, dict):
-                    tk = t.get("team_key"); name = t.get("name") or tk
-                elif isinstance(t, list):
-                    for kv in t:
-                        if isinstance(kv, dict):
-                            if "team_key" in kv: tk = kv["team_key"]
-                            if "name" in kv and not name: name = kv["name"]
-                if tk: teams.append({"team_key": tk, "name": name or tk})
-        except Exception:
-            st.error("Could not list teams.")
-            teams = []
-
-        name_map = { (("YOU: " if t["team_key"]==team_key_you else "") + (t["name"] or t["team_key"])): t["team_key"] for t in teams }
-        if not name_map:
-            st.info("No teams yet.")
-        else:
-            left = st.selectbox("Your team", [k for k in name_map.keys() if k.startswith("YOU:")] or list(name_map.keys()))
-            right = st.selectbox("Other team", [k for k in name_map.keys() if k != left])
-
-            def team_roster_df(tk):
-                T = yfa.Team(sc, tk)
-                rows=[]
-                for p in T.roster() or []:
-                    pts = p.get("points") or p.get("proj_points") or 0
-                    rows.append({"player_id": p.get("player_id"), "name": p.get("name"), "pos": ",".join(p.get("eligible_positions", [])), "points": float(pts)})
-                return pd.DataFrame(rows)
-
-            df_left = team_roster_df(name_map[left])
-            df_right = team_roster_df(name_map[right])
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write("Your roster")
-                st.dataframe(df_left, use_container_width=True)
-                offer_ids = st.multiselect("Offer player IDs", df_left["player_id"].tolist())
-            with col2:
-                st.write("Their roster")
-                st.dataframe(df_right, use_container_width=True)
-                request_ids = st.multiselect("Request player IDs", df_right["player_id"].tolist())
-
-            def value(df, ids):
-                return float(df[df["player_id"].isin(ids)].points.sum())
-
-            v_you_out = value(df_left, offer_ids)
-            v_you_in  = value(df_right, request_ids)
-            delta_you = v_you_in - v_you_out
-
-            v_them_out = value(df_right, request_ids)
-            v_them_in  = value(df_left, offer_ids)
-            delta_them = v_them_in - v_them_out
-
-            st.write(f"**Your Δ value:** {delta_you:+.1f}  |  **Their Δ value:** {delta_them:+.1f}")
-
-            if OPENAI_OK and st.button("Draft a trade pitch (OpenAI)"):
-                try:
-                    msg = f"We propose trading {offer_ids} for {request_ids}. Our delta {delta_you:+.1f}, their delta {delta_them:+.1f}. Write a friendly, 3‑sentence pitch."
-                    resp = OPENAI_CLIENT.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role":"user","content":msg}],
-                        max_tokens=150, temperature=0.6
-                    )
-                    st.info(resp.choices[0].message.content.strip())
-                except Exception as e:
-                    st.warning(f"OpenAI not available: {e}")
-
-    # 5) Scheduler / Automation (preferences only; you can wire a cron/Action to call a script)
-    with tabs[5]:
-        st.subheader("Scheduler / Automation")
-        st.caption("These are preferences the agent will use. To fully automate, trigger a daily script (cron, GitHub Action, or Cloud Scheduler) that reads this file and calls the same functions.")
-        prefs = {"auto_lineup": False, "auto_waivers": False, "waiver_budget_cap": 25, "aggression": 0.15}
-        if PREFS_FILE.exists():
+        if OPENAI_OK and st.button("Explain lineup (OpenAI)"):
             try:
-                prefs.update(json.loads(PREFS_FILE.read_text()))
-            except Exception:
-                pass
+                roster_summary = "\n".join([f"{slot}: {p['name']} ({p['score']:.1f})" for slot, p in starters])
+                bench_summary = "\n".join([f"{r['name']} ({r['score']:.1f})" for _, r in bench.head(5).iterrows()])
+                resp = OPENAI_CLIENT.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role":"system","content":"You are a fantasy football assistant. Be concise."},
+                        {"role":"user","content": f"Starters:\n{roster_summary}\nBench (top 5):\n{bench_summary}"}
+                    ],
+                    max_tokens=250, temperature=0.2
+                )
+                st.info(resp.choices[0].message.content.strip())
+            except Exception as e:
+                st.warning(f"OpenAI explanation not available: {e}")
 
-        prefs["auto_lineup"] = st.toggle("Auto set best lineup (Thu/Sun)", value=prefs["auto_lineup"])
-        prefs["auto_waivers"] = st.toggle("Auto submit waivers", value=prefs["auto_waivers"])
-        prefs["waiver_budget_cap"] = st.slider("Max FAAB per week", 0, 100, value=int(prefs["waiver_budget_cap"]))
-        prefs["aggression"] = st.slider("Waiver aggression (0.05–0.35)", 0.05, 0.35, value=float(prefs["aggression"]), step=0.01)
+# 3) Waivers
+with tabs[3]:
+    st.subheader("Waiver targets & Approvals")
+    try:
+        L = yfa.League(sc, league_key)
+        cands = free_agents(L)
+    except Exception as e:
+        st.error(f"Failed to get free agents: {e}")
+        cands = []
 
-        if st.button("Save preferences"):
-            PREFS_FILE.write_text(json.dumps(prefs, indent=2))
-            st.success("Saved.")
+    team_df = roster_df(sc, league_key)
+
+    def positional_needs(roster_df: pd.DataFrame):
+        need = {"QB":0,"RB":0,"WR":0,"TE":0,"DEF":0}
+        for _, r in roster_df.iterrows():
+            for p in str(r.get("eligible_positions","")).split(","):
+                p = p.strip().upper()
+                if p in need: need[p] += 1
+        return need
+
+    def suggest_faab(points_gain, budget=100, aggression=0.15):
+        # very simple: value 0–1 → FAAB percent
+        scale = min(max(points_gain/20.0, 0), 1)  # assume 20 pts = max impact
+        return int(round(budget * (aggression * scale)))
+
+    if not cands:
+        st.info("No candidates returned right now.")
+    else:
+        st.write("### Suggested priorities")
+        needs = positional_needs(team_df) if not team_df.empty else {}
+        faab_budget = settings.get("faab_budget") or 100
+        shown = []
+        for c in cands:
+            need_boost = 4 if needs.get(c["position"], 0) <= 1 else 0
+            score = (c["points"] or 0) + need_boost
+            bid = suggest_faab(points_gain=c["points"] or 0, budget=faab_budget)
+            shown.append({"name": c["name"], "pos": c["position"], "points": c["points"], "score": score, "suggested_faab": bid, "player_id": c["player_id"]})
+        dfw = pd.DataFrame(shown).sort_values("score", ascending=False)
+        st.dataframe(dfw, use_container_width=True)
 
         st.divider()
-        st.write("**Run now (manual):**")
-        if st.button("Simulate weekly waivers now"):
-            st.info("This will compute waiver suggestions using current free agents and preferences. (Submission still requires clicking Approve in Waivers tab.)")
+        st.write("### Approve & Execute")
+        if not dfw.empty:
+            idx = st.number_input("Row to add (0‑based from table above)", min_value=0, max_value=len(dfw)-1, value=0)
+            pick = dfw.iloc[int(idx)]
+            drop_pid = st.text_input("Player ID to drop (optional)")
+            faab_bid = st.number_input("FAAB bid (optional)", min_value=0, max_value=300, value=int(pick["suggested_faab"]))
+            if st.button("Approve transaction"):
+                try:
+                    result = execute_add_drop(sc, league_key, add_pid=str(pick["player_id"]),
+                                              drop_pid=drop_pid or None,
+                                              faab_bid=int(faab_bid) if faab_bid else None)
+                    if result.get("status") == "ok":
+                        st.success("Transaction submitted ✅")
+                        st.json(result.get("details"))
+                    else:
+                        st.error("Transaction failed"); st.json(result)
+                except Exception as e:
+                    st.error(f"Execution error: {e}")
+
+# 4) Trades (Evaluator)
+with tabs[4]:
+    st.subheader("Trade Evaluator")
+    st.caption("Pick players to offer/request. We estimate value using current points/projections. For better accuracy, upload projections in Draft Assistant.")
+    league = yfa.League(sc, league_key)
+    team_key_you = resolve_team_key(sc, league_key)
+    teams = []
+    try:
+        for t in league.teams():
+            tk = None; name = None
+            if isinstance(t, dict):
+                tk = t.get("team_key"); name = t.get("name") or tk
+            elif isinstance(t, list):
+                for kv in t:
+                    if isinstance(kv, dict):
+                        if "team_key" in kv: tk = kv["team_key"]
+                        if "name" in kv and not name: name = kv["name"]
+            if tk: teams.append({"team_key": tk, "name": name or tk})
+    except Exception:
+        st.error("Could not list teams.")
+        teams = []
+
+    name_map = { (("YOU: " if t["team_key"]==team_key_you else "") + (t["name"] or t["team_key"])): t["team_key"] for t in teams }
+    if not name_map:
+        st.info("No teams yet.")
+    else:
+        left = st.selectbox("Your team", [k for k in name_map.keys() if k.startswith("YOU:")] or list(name_map.keys()))
+        right = st.selectbox("Other team", [k for k in name_map.keys() if k != left])
+
+        def team_roster_df(tk):
+            T = yfa.Team(sc, tk)
+            rows=[]
+            for p in T.roster() or []:
+                pts = p.get("points") or p.get("proj_points") or 0
+                rows.append({"player_id": p.get("player_id"), "name": p.get("name"), "pos": ",".join(p.get("eligible_positions", [])), "points": float(pts)})
+            return pd.DataFrame(rows)
+
+        df_left = team_roster_df(name_map[left])
+        df_right = team_roster_df(name_map[right])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("Your roster")
+            st.dataframe(df_left, use_container_width=True)
+            offer_ids = st.multiselect("Offer player IDs", df_left["player_id"].tolist())
+        with col2:
+            st.write("Their roster")
+            st.dataframe(df_right, use_container_width=True)
+            request_ids = st.multiselect("Request player IDs", df_right["player_id"].tolist())
+
+        def value(df, ids):
+            return float(df[df["player_id"].isin(ids)].points.sum())
+
+        v_you_out = value(df_left, offer_ids)
+        v_you_in  = value(df_right, request_ids)
+        delta_you = v_you_in - v_you_out
+
+        v_them_out = value(df_right, request_ids)
+        v_them_in  = value(df_left, offer_ids)
+        delta_them = v_them_in - v_them_out
+
+        st.write(f"**Your Δ value:** {delta_you:+.1f}  |  **Their Δ value:** {delta_them:+.1f}")
+
+        if OPENAI_OK and st.button("Draft a trade pitch (OpenAI)"):
+            try:
+                msg = f"We propose trading {offer_ids} for {request_ids}. Our delta {delta_you:+.1f}, their delta {delta_them:+.1f}. Write a friendly, 3‑sentence pitch."
+                resp = OPENAI_CLIENT.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role":"user","content":msg}],
+                    max_tokens=150, temperature=0.6
+                )
+                st.info(resp.choices[0].message.content.strip())
+            except Exception as e:
+                st.warning(f"OpenAI not available: {e}")
+
+# 5) Scheduler / Automation
+with tabs[5]:
+    st.subheader("Scheduler / Automation")
+    st.caption("These are preferences the agent will use. To fully automate, trigger a daily script (cron, GitHub Action, or Cloud Scheduler) that reads this file and calls the same functions.")
+    prefs = {"auto_lineup": False, "auto_waivers": False, "waiver_budget_cap": 25, "aggression": 0.15}
+    if PREFS_FILE.exists():
+        try:
+            prefs.update(json.loads(PREFS_FILE.read_text()))
+        except Exception:
+            pass
+
+    prefs["auto_lineup"] = st.toggle("Auto set best lineup (Thu/Sun)", value=prefs["auto_lineup"])
+    prefs["auto_waivers"] = st.toggle("Auto submit waivers", value=prefs["auto_waivers"])
+    prefs["waiver_budget_cap"] = st.slider("Max FAAB per week", 0, 100, value=int(prefs["waiver_budget_cap"]))
+    prefs["aggression"] = st.slider("Waiver aggression (0.05–0.35)", 0.05, 0.35, value=float(prefs["aggression"]), step=0.01)
+
+    if st.button("Save preferences"):
+        PREFS_FILE.write_text(json.dumps(prefs, indent=2))
+        st.success("Saved.")
+
+    st.divider()
+    st.write("**Run now (manual):**")
+    if st.button("Simulate weekly waivers now"):
+        st.info("This will compute waiver suggestions using current free agents and preferences. (Submission still requires clicking Approve in Waivers tab.)")
+
 
 
