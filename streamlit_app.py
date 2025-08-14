@@ -470,12 +470,116 @@ def filter_latest_nfl_leagues(leagues, games):
     latest = max(nfl_games, key=lambda g: to_int(g["season"]))
     latest_gk = latest["game_key"]
     return [L for L in leagues if L.get("game_key") == latest_gk]
+def yfs_get(sc, path):
+    """GET against Yahoo Fantasy Sports v2 and return JSON."""
+    url = "https://fantasysports.yahooapis.com/fantasy/v2" + path
+    r = sc.session.get(url, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def parse_games_leagues_v2(raw):
+    """
+    Parse Yahoo JSON with numeric keys + arrays (exactly like your debug blob).
+    Returns:
+      games   = [{"game_key","game_code","season","name"}]
+      leagues = [{"game_key","league_key","name"}]
+    """
+    fc = (raw or {}).get("fantasy_content", {})
+    users = fc.get("users", {})
+
+    # Locate the user array
+    user_arr = None
+    if isinstance(users, dict):
+        if "user" in users:
+            user_arr = users["user"]
+        else:
+            for k, v in users.items():
+                if str(k).isdigit() and isinstance(v, dict) and "user" in v:
+                    user_arr = v["user"]
+                    break
+    if not user_arr:
+        return [], []
+
+    # Find "games" container in user array
+    games_container = None
+    for entry in user_arr:
+        if isinstance(entry, dict) and "games" in entry:
+            games_container = entry["games"]
+            break
+    if not games_container:
+        return [], []
+
+    games, leagues = [], []
+
+    # Each key "0","1",... → {"game": [ meta, {"leagues": {...}}, ... ]}
+    for _, game_wrapper in games_container.items():
+        if not isinstance(game_wrapper, dict):
+            continue
+        glist = game_wrapper.get("game")
+        if not isinstance(glist, list):
+            continue
+
+        # meta has code/season (or at least game_key)
+        gmeta = None
+        for elem in glist:
+            if isinstance(elem, dict) and ("code" in elem or "game_code" in elem) and "season" in elem:
+                gmeta = elem
+                break
+        if not gmeta:
+            for elem in glist:
+                if isinstance(elem, dict) and "game_key" in elem:
+                    gmeta = elem
+                    break
+        if not gmeta:
+            continue
+
+        gk = gmeta.get("game_key")
+        gc = gmeta.get("code") or gmeta.get("game_code")
+        season = gmeta.get("season")
+        gname = gmeta.get("name") or f"{gc} {season}"
+        games.append({"game_key": gk, "game_code": gc, "season": season, "name": gname})
+
+        # leagues for this game
+        for elem in glist:
+            if isinstance(elem, dict) and "leagues" in elem:
+                leagues_dict = elem["leagues"]
+                for _, lwrap in leagues_dict.items():
+                    if not isinstance(lwrap, dict):
+                        continue
+                    lst = lwrap.get("league")
+                    if isinstance(lst, list):
+                        for lentry in lst:
+                            if isinstance(lentry, dict):
+                                lk = lentry.get("league_key")
+                                nm = lentry.get("name") or lk
+                            elif isinstance(lentry, list):
+                                lk = nm = None
+                                for kv in lentry:
+                                    if "league_key" in kv: lk = kv["league_key"]
+                                    if "name" in kv: nm = kv["name"]
+                                nm = nm or lk
+                            else:
+                                continue
+                            if lk:
+                                leagues.append({"game_key": gk, "league_key": lk, "name": nm})
+    return games, leagues
+
+def filter_latest_nfl_leagues(leagues, games):
+    """Keep leagues belonging to the latest NFL (game_code='nfl') season."""
+    def to_int(s):
+        try: return int(str(s))
+        except: return -1
+    nfl_games = [g for g in games if (g.get("game_code") == "nfl" and g.get("season"))]
+    if not nfl_games:
+        return []
+    latest = max(nfl_games, key=lambda g: to_int(g["season"]))
+    latest_gk = latest["game_key"]
+    return [L for L in leagues if L.get("game_key") == latest_gk]
 
 
 # ---------------- Live data: leagues ----------------
 try:
     sc = get_session()
-    # user-scoped: all games + leagues
     raw = yfs_get(sc, "/users;use_login=1/games/leagues?format=json")
     games, leagues_all = parse_games_leagues_v2(raw)
     nfl_leags = filter_latest_nfl_leagues(leagues_all, games)
@@ -483,21 +587,22 @@ except Exception as e:
     st.error(f"Init error: {e}")
     st.stop()
 
-with st.expander("Debug: parsed games (latest NFL should be present)"):
+with st.expander("Debug: parsed games"):
     st.write(games)
-with st.expander("Debug: all leagues parsed"):
+with st.expander("Debug: all leagues"):
     st.write(leagues_all)
-with st.expander("Debug: filtered latest NFL leagues"):
+with st.expander("Debug: latest NFL leagues"):
     st.write(nfl_leags)
 
 if not nfl_leags:
     st.warning("No NFL leagues found for this Yahoo account (latest season).")
-    st.caption("If you DO have NFL leagues this season, double-check you authorized the correct Yahoo account and scope `fspt-w`.")
+    st.caption("If you DO have NFL leagues this season, re-check you authorized the right Yahoo ID and scope 'fspt-w'.")
     st.stop()
 
 league_map = {f"{lg['name']} ({lg['league_key']})": lg["league_key"] for lg in nfl_leags}
 choice = st.selectbox("Select a league", list(league_map.keys()))
 league_key = league_map[choice]
+
 
 
 
