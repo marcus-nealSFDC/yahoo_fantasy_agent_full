@@ -1,0 +1,8 @@
+streamlit>=1.33
+pandas>=2.2
+requests>=2.31
+python-dotenv>=1.0
+yahoo-fantasy-api>=2.12
+yahoo_oauth>=1.1
+openai>=1.40
+pydantic>=2.7

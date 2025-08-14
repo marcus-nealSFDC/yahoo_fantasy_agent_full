@@ -1,0 +1,4 @@
+.env
+oauth2.json
+__pycache__/
+.DS_Store
