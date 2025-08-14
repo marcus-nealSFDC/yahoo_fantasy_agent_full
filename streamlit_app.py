@@ -263,19 +263,86 @@ def fetch_nfl_leagues(sc):
             pass
 
     return leagues or []
+def fetch_nfl_leagues_user(sc):
+    """
+    Reliable, user-scoped fetch of leagues for the logged-in account.
+    Uses: /fantasy/v2/users;use_login=1/games;game_keys=nfl/leagues?format=json
+    Returns a list of dicts: [{"league_key": "...","name": "..."}]
+    """
+    import requests
+    url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys=nfl/leagues?format=json"
+    # yahoo_oauth.OAuth2 gives us an authorized requests.Session as sc.session
+    sess = sc.session
+    r = sess.get(url, timeout=30)
+    data = r.json()
+
+    # Walk the JSON safely and extract leagues
+    leagues_out = []
+    try:
+        # Structure (JSON): users.user[0].games.game[*].leagues.league[*]
+        users = data.get("fantasy_content", {}).get("users", {})
+        user = users.get("user", [None])[0] or {}
+        games = (user.get("games", {}) or {}).get("game", []) or []
+        for g in games:
+            leagues = (g.get("leagues", {}) or {}).get("league", []) or []
+            for entry in leagues:
+                # each entry may be dict or [ { "league_key": ... }, { "name": ... }, ... ]
+                if isinstance(entry, dict):
+                    lk = entry.get("league_key")
+                    nm = entry.get("name") or lk
+                elif isinstance(entry, list):
+                    # list of one-key dicts
+                    lk = None; nm = None
+                    for kv in entry:
+                        if "league_key" in kv: lk = kv["league_key"]
+                        if "name" in kv: nm = kv["name"]
+                    if nm is None: nm = lk
+                else:
+                    continue
+                if lk:
+                    leagues_out.append({"league_key": lk, "name": nm})
+    except Exception:
+        pass
+    return leagues_out
 
 
 # ---------------- Live data: leagues ----------------
+# ---------------- Live data: leagues ----------------
 try:
     sc = get_session()
-    leagues = fetch_nfl_leagues(sc)
+    # First try robust user-scoped call
+    leagues = fetch_nfl_leagues_user(sc)
+    # If that comes back empty, fall back to the library’s Game helper just in case
+    if not leagues:
+        gm = yfa.Game(sc, "nfl")
+        # Try multiple variants to cover version differences
+        season = None
+        for attr in ("current_game_id", "current_season", "game_id"):
+            if hasattr(gm, attr):
+                try:
+                    season = getattr(gm, attr)()
+                    break
+                except Exception:
+                    pass
+        try:
+            leagues = gm.leagues(season) if season is not None and hasattr(gm, "leagues") else gm.leagues()
+        except Exception:
+            # last resort: league_ids -> minimal objects
+            if hasattr(gm, "league_ids"):
+                try:
+                    ids = gm.league_ids(season) if season is not None else gm.league_ids()
+                    leagues = [{"league_key": lid, "name": lid} for lid in ids]
+                except Exception:
+                    leagues = []
 except Exception as e:
     st.error(f"Init error: {e}")
     st.stop()
 
 if not leagues:
     st.warning("No NFL leagues found for this Yahoo account.")
+    st.caption("Tip: Make sure you are logged into the Yahoo account that actually owns/joins the leagues, and that the app requested the Fantasy Sports scope.")
     st.stop()
+
 
 # ---------------- Tabs: Roster / Start-Sit / Waivers ----------------
 tab1, tab2, tab3 = st.tabs(["Roster", "Start/Sit (heuristic)", "Waivers (Add/Drop or FAAB)"])
