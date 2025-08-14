@@ -89,12 +89,94 @@ def get_session() -> OAuth2:
 
 # ---------------- Data helpers ----------------
 def resolve_team_key(sc, league_key: str):
+    """
+    Return the team_key for the logged-in user in the given league.
+    1) Try through yahoo_fantasy_api League.teams() (shape varies by version)
+    2) Fallback to Yahoo user-scoped teams endpoint and match by league_key prefix
+       (team_key looks like: "<game_key>.l.<league_id>.t.<team_id>")
+    """
     L = yfa.League(sc, league_key)
-    for t in L.teams():
-        if t.get("is_owned_by_current_login") == 1:
-            return t["team_key"]
-    teams = L.teams()
-    return teams[0]["team_key"] if teams else None
+
+    # ---- Try via library first, but guard for mixed shapes
+    try:
+        teams = L.teams()
+        def extract_team_key(entry):
+            # entry might be dict, list-of-dicts, etc.
+            if isinstance(entry, dict):
+                return entry.get("team_key"), entry.get("is_owned_by_current_login")
+            if isinstance(entry, list):
+                tk = None
+                owned = None
+                for kv in entry:
+                    if isinstance(kv, dict):
+                        if tk is None and "team_key" in kv:
+                            tk = kv["team_key"]
+                        if owned is None and "is_owned_by_current_login" in kv:
+                            owned = kv["is_owned_by_current_login"]
+                return tk, owned
+            return None, None
+
+        # Prefer the one owned by current login, if that flag is present
+        for t in teams:
+            tk, owned = extract_team_key(t)
+            if owned in (1, True, "1") and tk:
+                return tk
+
+        # Otherwise just return the first usable team_key
+        for t in teams:
+            tk, _ = extract_team_key(t)
+            if tk:
+                return tk
+    except Exception:
+        pass
+
+    # ---- Fallback: user-scoped teams endpoint, match team by league_key
+    try:
+        data = yfs_get(sc, "/users;use_login=1/teams?format=json")
+        fc = (data or {}).get("fantasy_content", {})
+        users = fc.get("users", {})
+        # Find the array that holds the 'user'
+        user_arr = None
+        if isinstance(users, dict):
+            if "user" in users:
+                user_arr = users["user"]
+            else:
+                for k, v in users.items():
+                    if str(k).isdigit() and isinstance(v, dict) and "user" in v:
+                        user_arr = v["user"]
+                        break
+        if user_arr:
+            # Find the "teams" container
+            teams_container = None
+            for entry in user_arr:
+                if isinstance(entry, dict) and "teams" in entry:
+                    teams_container = entry["teams"]
+                    break
+            if teams_container:
+                # Walk teams; shape similar to games/leagues (numeric keys)
+                for _, twrap in teams_container.items():
+                    if not isinstance(twrap, dict): 
+                        continue
+                    tlist = twrap.get("team")
+                    if not isinstance(tlist, list): 
+                        continue
+                    # Collect fields from the list
+                    tk = None
+                    for el in tlist:
+                        if isinstance(el, dict) and "team_key" in el:
+                            tk = el["team_key"]
+                            break
+                        if isinstance(el, list):
+                            for kv in el:
+                                if isinstance(kv, dict) and "team_key" in kv:
+                                    tk = kv["team_key"]
+                                    break
+                    if tk and tk.startswith(league_key + ".t."):
+                        return tk
+    except Exception:
+        pass
+
+    return None
 
 def roster_df(sc, league_key: str) -> pd.DataFrame:
     L = yfa.League(sc, league_key)
@@ -103,16 +185,21 @@ def roster_df(sc, league_key: str) -> pd.DataFrame:
         return pd.DataFrame()
     T = yfa.Team(sc, team_key)
     rows = []
-    for p in T.roster():
+    for p in T.roster() or []:
+        name = p.get("name") if isinstance(p, dict) else None
+        elig = p.get("eligible_positions") if isinstance(p, dict) else None
+        if isinstance(elig, list):
+            elig = ",".join(elig)
         rows.append({
-            "player_id": p.get("player_id"),
-            "name": p.get("name"),
-            "status": p.get("status"),
-            "eligible_positions": ",".join(p.get("eligible_positions", [])),
-            "selected_position": p.get("selected_position"),
-            "points": p.get("points") or p.get("proj_points") or 0,
+            "player_id": p.get("player_id") if isinstance(p, dict) else None,
+            "name": name,
+            "status": p.get("status") if isinstance(p, dict) else None,
+            "eligible_positions": elig or "",
+            "selected_position": p.get("selected_position") if isinstance(p, dict) else None,
+            "points": (p.get("points") if isinstance(p, dict) else 0) or (p.get("proj_points") if isinstance(p, dict) else 0) or 0,
         })
     return pd.DataFrame(rows)
+
 
 def free_agents(L: "yfa.League", positions=("WR","RB","TE","QB"), limit=30):
     fa = []
