@@ -209,31 +209,39 @@ def filter_latest_nfl_leagues(leagues, games):
 
 # ───────────────────── Data helpers ─────────────────────
 def resolve_team_key(sc, league_key: str):
-    """Return your team_key in a league; robust to yfa shapes."""
+    """Return your team_key in a league; logs attempts for clarity."""
     L = yfa.League(sc, league_key)
+
+    # Try library first
     try:
         teams = L.teams()
+        st.caption("resolve_team_key: L.teams() returned "
+                   + (str(len(teams)) if hasattr(teams, "__len__") else "unknown length"))
         def extract(entry):
             if isinstance(entry, dict):
-                return entry.get("team_key"), entry.get("is_owned_by_current_login")
+                return entry.get("team_key"), entry.get("is_owned_by_current_login"), entry.get("name")
             if isinstance(entry, list):
-                tk = owned = None
+                tk = owned = name = None
                 for kv in entry:
                     if isinstance(kv, dict):
                         if tk is None and "team_key" in kv: tk = kv["team_key"]
                         if owned is None and "is_owned_by_current_login" in kv: owned = kv["is_owned_by_current_login"]
-                return tk, owned
-            return None, None
+                        if name is None and "name" in kv: name = kv["name"]
+                return tk, owned, name
+            return None, None, None
+
         for t in teams:
-            tk, owned = extract(t)
+            tk, owned, name = extract(t)
             if owned in (1, True, "1") and tk:
+                st.caption(f"resolve_team_key: picking owned team {name} ({tk})")
                 return tk
         for t in teams:
-            tk, _ = extract(t)
+            tk, owned, name = extract(t)
             if tk:
+                st.caption(f"resolve_team_key: falling back to first team {name} ({tk})")
                 return tk
-    except Exception:
-        pass
+    except Exception as e:
+        st.caption(f"resolve_team_key: L.teams() failed: {e}")
 
     # Fallback via /users;use_login=1/teams
     try:
@@ -255,18 +263,23 @@ def resolve_team_key(sc, league_key: str):
                     if not isinstance(twrap, dict): continue
                     tlist = twrap.get("team")
                     if not isinstance(tlist, list): continue
-                    tk = None
+                    tk = None; name = None
                     for el in tlist:
-                        if isinstance(el, dict) and "team_key" in el:
-                            tk = el["team_key"]; break
+                        if isinstance(el, dict):
+                            if "team_key" in el: tk = el["team_key"]
+                            if "name" in el and not name: name = el["name"]
                         if isinstance(el, list):
                             for kv in el:
-                                if isinstance(kv, dict) and "team_key" in kv:
-                                    tk = kv["team_key"]; break
+                                if isinstance(kv, dict):
+                                    if "team_key" in kv: tk = kv["team_key"]
+                                    if "name" in kv and not name: name = kv["name"]
                     if tk and tk.startswith(league_key + ".t."):
+                        st.caption(f"resolve_team_key: matched via /users teams → {name} ({tk})")
                         return tk
-    except Exception:
-        pass
+        st.caption("resolve_team_key: no match in /users;use_login=1/teams")
+    except Exception as e:
+        st.caption(f"resolve_team_key: users/teams fallback failed: {e}")
+
     return None
 
 def roster_df(sc, league_key: str) -> pd.DataFrame:
@@ -355,6 +368,66 @@ def execute_add_drop(sc, league_key: str, add_pid: str, drop_pid: str|None=None,
 
     return {"status": "error", "details": last_err or "No supported add/waiver method found."}
 
+# ───────── Extra diag: list all user teams and highlight match ─────────
+def render_user_teams(sc, league_key: str):
+    """Show all teams for the logged-in user and highlight the one in this league."""
+    try:
+        data = yfs_get(sc, "/users;use_login=1/teams?format=json")
+    except Exception as e:
+        st.error(f"/users;use_login=1/teams failed: {e}")
+        return
+
+    fc = (data or {}).get("fantasy_content", {})
+    users = fc.get("users", {})
+    user_arr = users.get("user") if "user" in users else None
+    if not user_arr:
+        for k, v in users.items():
+            if str(k).isdigit() and isinstance(v, dict) and "user" in v:
+                user_arr = v["user"]; break
+
+    rows = []
+    if user_arr:
+        teams_container = None
+        for entry in user_arr:
+            if isinstance(entry, dict) and "teams" in entry:
+                teams_container = entry["teams"]; break
+        if teams_container:
+            for _, twrap in teams_container.items():
+                if not isinstance(twrap, dict): 
+                    continue
+                tlist = twrap.get("team")
+                if not isinstance(tlist, list): 
+                    continue
+                info = {"team_key": None, "team_name": None, "league_key_guess": None, "manager": None}
+                for el in tlist:
+                    if isinstance(el, dict):
+                        if "team_key" in el: 
+                            info["team_key"] = el["team_key"]
+                            parts = el["team_key"].split(".t.")[0] if ".t." in el["team_key"] else None
+                            info["league_key_guess"] = parts
+                        if "name" in el: info["team_name"] = el["name"]
+                        if "managers" in el and isinstance(el["managers"], dict):
+                            mgr = el["managers"].get("manager", [{}])[0]
+                            if isinstance(mgr, dict) and "nickname" in mgr:
+                                info["manager"] = mgr["nickname"]
+                if info["team_key"]:
+                    rows.append(info)
+
+    if not rows:
+        st.info("No teams found in /users;use_login=1/teams (this is normal if all your leagues are pre‑draft).")
+        return
+
+    df = pd.DataFrame(rows)
+    df["matches_selected_league"] = df["league_key_guess"] == league_key
+    st.write("#### User Teams (from /users;use_login=1/teams)")
+    st.dataframe(df, use_container_width=True)
+
+    match = df[df["matches_selected_league"]]
+    if match.empty:
+        st.warning("No team matches the selected league yet. If you haven’t drafted, this is expected.")
+    else:
+        st.success(f"Found your team for this league: {match.iloc[0]['team_key']}")
+
 # ───────────────── Sidebar: Connect ─────────────────
 with st.sidebar:
     st.header("Yahoo Connection")
@@ -417,6 +490,9 @@ league_map = {f"{lg['name']} ({lg['league_key']})": lg["league_key"] for lg in n
 choice = st.selectbox("Select a league", list(league_map.keys()))
 league_key = league_map[choice]
 
+# Show user teams table to clarify whether a team exists for this league
+render_user_teams(sc, league_key)
+
 # ─────────────── League status + pre‑draft gate (robust) ───────────────
 def get_league_settings_safe(sc, league_key: str) -> dict:
     """Robust settings fetch (library first, then raw API)."""
@@ -473,7 +549,7 @@ with st.expander("League info", expanded=False):
         "faab_budget": settings.get("faab_budget"),
     })
 
-# Clear "why no data" explainer
+# Clear “why no data” explainer
 empty_reasons = []
 if not settings:
     empty_reasons.append("League settings could not be read (Yahoo may be rate‑limiting or the league is not finalized).")
@@ -606,8 +682,6 @@ with tabs[0]:
                     ["position","tier","proj_points"], ascending=[True, True, False]
                 )
                 st.dataframe(tiers_df.reset_index(drop=True), use_container_width=True)
-        except Exception as e:
-            st.error(f"Could not read CSV: {e}")
     else:
         st.caption("Upload projections/ADP to populate tiers.")
 
@@ -853,6 +927,7 @@ with tabs[5]:
     st.write("**Run now (manual):**")
     if st.button("Simulate weekly waivers now"):
         st.info("This will compute waiver suggestions using current free agents and preferences. (Submission still requires clicking Approve in Waivers tab.)")
+
 
 
 
