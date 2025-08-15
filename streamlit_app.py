@@ -29,6 +29,9 @@ except Exception:
 st.set_page_config(page_title="Yahoo Fantasy Agent — Live", layout="wide")
 st.title("🏈 Yahoo Fantasy Agent — Live")
 
+# Toggle to show raw Yahoo responses
+show_raw = st.toggle("🔎 Show raw Yahoo API responses", value=False)
+
 # ─────────────────────── OAuth helpers ───────────────────────
 def authorize_url():
     return "https://api.login.yahoo.com/oauth2/request_auth?" + urlencode({
@@ -91,9 +94,10 @@ def yfs_get(sc, path):
     url = "https://fantasysports.yahooapis.com/fantasy/v2" + path
     r = sc.session.get(url, headers={"Accept": "application/json"}, timeout=30)
 
-    with st.expander(f"HTTP debug: {path}"):
-        st.write({"url": url, "status_code": r.status_code, "content_type": r.headers.get("Content-Type", "")})
-        st.code((r.text or "")[:1000])
+    if show_raw:
+        with st.expander(f"HTTP debug: {path}", expanded=True):
+            st.write({"url": url, "status_code": r.status_code, "content_type": r.headers.get("Content-Type", "")})
+            st.code((r.text or "")[:1500])
 
     if r.status_code == 401:
         raise RuntimeError("401 Unauthorized: token invalid/expired or scope missing. Click Connect again.")
@@ -399,9 +403,10 @@ except Exception as e:
     st.error(f"Init error while loading leagues: {e}")
     st.stop()
 
-with st.expander("Debug: parsed games"): st.write(games)
-with st.expander("Debug: all leagues"): st.write(leagues_all)
-with st.expander("Debug: latest NFL leagues"): st.write(nfl_leags)
+if show_raw:
+    with st.expander("Debug: parsed games", expanded=False): st.write(games)
+    with st.expander("Debug: all leagues", expanded=False): st.write(leagues_all)
+    with st.expander("Debug: latest NFL leagues", expanded=False): st.write(nfl_leags)
 
 if not nfl_leags:
     st.warning("No NFL leagues found for this Yahoo account (latest season).")
@@ -456,7 +461,7 @@ draft_status = coerce_draft_status(settings.get("draft_status"))
 badge = {"predraft":"🟡", "postdraft":"🟢", "inseason":"🟢", "unknown":"⚠️"}.get(draft_status, "⚠️")
 st.markdown(f"### League status: {badge} **{draft_status}**")
 
-with st.expander("League info"):
+with st.expander("League info", expanded=False):
     st.write({
         "league_key": league_key,
         "name": settings.get("name"),
@@ -467,6 +472,56 @@ with st.expander("League info"):
         "waiver_type": settings.get("waiver_type"),
         "faab_budget": settings.get("faab_budget"),
     })
+
+# Clear "why no data" explainer
+empty_reasons = []
+if not settings:
+    empty_reasons.append("League settings could not be read (Yahoo may be rate‑limiting or the league is not finalized).")
+if draft_status in ("predraft", "unknown"):
+    empty_reasons.append("League shows as pre‑draft or unknown; teams/rosters aren’t published yet.")
+# Probe teams/roster to refine message
+try:
+    L_probe = yfa.League(sc, league_key)
+    teams_probe = L_probe.teams()
+    if not teams_probe:
+        empty_reasons.append("No teams returned by Yahoo for this league yet.")
+    else:
+        tk_probe = resolve_team_key(sc, league_key)
+        if tk_probe:
+            try:
+                T_probe = yfa.Team(sc, tk_probe)
+                roster_probe = T_probe.roster()
+                if not roster_probe:
+                    empty_reasons.append("Your roster is empty right now (common pre‑draft).")
+            except Exception:
+                empty_reasons.append("Could not fetch your roster (authentication/scope or timing).")
+        else:
+            empty_reasons.append("Could not match your team_key in this league yet.")
+except Exception:
+    empty_reasons.append("League probe failed (network/auth).")
+
+if empty_reasons:
+    st.warning("ℹ️ **Why you may not see data yet:**\n\n- " + "\n- ".join(empty_reasons))
+    st.caption("Tip: toggle **‘Show raw Yahoo API responses’** above to inspect raw JSON and confirm status.")
+
+# Optional raw league endpoints peek
+if show_raw:
+    with st.expander("Raw league endpoints (sanity check)", expanded=False):
+        try:
+            raw_settings = yfs_get(sc, f"/league/{league_key}/settings?format=json")
+            st.write("**/league/.../settings**:", raw_settings)
+        except Exception as e:
+            st.error(f"settings error: {e}")
+        try:
+            raw_standings = yfs_get(sc, f"/league/{league_key}/standings?format=json")
+            st.write("**/league/.../standings**:", raw_standings)
+        except Exception as e:
+            st.error(f"standings error: {e}")
+        try:
+            raw_teams = yfs_get(sc, f"/league/{league_key}/teams?format=json")
+            st.write("**/league/.../teams**:", raw_teams)
+        except Exception as e:
+            st.error(f"teams error: {e}")
 
 # PRE‑DRAFT → show only Draft Assistant and STOP
 if draft_status != "postdraft":
@@ -561,7 +616,10 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("Current Roster")
     df_roster = roster_df(sc, league_key)
-    st.dataframe(df_roster, use_container_width=True)
+    if df_roster.empty:
+        st.info("No roster found. If your draft just ended, give Yahoo a little time then refresh.")
+    else:
+        st.dataframe(df_roster, use_container_width=True)
 
 # 2) Start/Sit
 with tabs[2]:
@@ -649,11 +707,11 @@ with tabs[3]:
 
     def suggest_faab(points_gain, budget=100, aggression=0.15):
         # very simple: value 0–1 → FAAB percent
-        scale = min(max(points_gain/20.0, 0), 1)  # assume 20 pts = max impact
+        scale = min(max((points_gain or 0)/20.0, 0), 1)  # assume 20 pts = max impact
         return int(round(budget * (aggression * scale)))
 
     if not cands:
-        st.info("No candidates returned right now.")
+        st.info("No free agents returned right now (or Yahoo didn’t surface any for these positions).")
     else:
         st.write("### Suggested priorities")
         needs = positional_needs(team_df) if not team_df.empty else {}
@@ -665,16 +723,19 @@ with tabs[3]:
             bid = suggest_faab(points_gain=c["points"] or 0, budget=faab_budget)
             shown.append({"name": c["name"], "pos": c["position"], "points": c["points"], "score": score, "suggested_faab": bid, "player_id": c["player_id"]})
         dfw = pd.DataFrame(shown).sort_values("score", ascending=False)
-        st.dataframe(dfw, use_container_width=True)
+        if dfw.empty:
+            st.info("No waiver suggestions at the moment.")
+        else:
+            st.dataframe(dfw, use_container_width=True)
 
-        st.divider()
-        st.write("### Approve & Execute")
-        if not dfw.empty:
-            idx = st.number_input("Row to add (0‑based from table above)", min_value=0, max_value=len(dfw)-1, value=0)
-            pick = dfw.iloc[int(idx)]
+            st.divider()
+            st.write("### Approve & Execute")
+            idx = st.number_input("Row to add (0‑based from table above)", min_value=0, max_value=max(0, len(dfw)-1), value=0)
+            pick = dfw.iloc[int(idx)] if not dfw.empty else None
             drop_pid = st.text_input("Player ID to drop (optional)")
-            faab_bid = st.number_input("FAAB bid (optional)", min_value=0, max_value=300, value=int(pick["suggested_faab"]))
-            if st.button("Approve transaction"):
+            default_bid = int(pick["suggested_faab"]) if pick is not None else 0
+            faab_bid = st.number_input("FAAB bid (optional)", min_value=0, max_value=300, value=default_bid)
+            if st.button("Approve transaction") and pick is not None:
                 try:
                     result = execute_add_drop(sc, league_key, add_pid=str(pick["player_id"]),
                                               drop_pid=drop_pid or None,
@@ -730,11 +791,17 @@ with tabs[4]:
         col1, col2 = st.columns(2)
         with col1:
             st.write("Your roster")
-            st.dataframe(df_left, use_container_width=True)
+            if df_left.empty:
+                st.info("Your roster is empty (pre‑draft or Yahoo hasn’t posted teams yet).")
+            else:
+                st.dataframe(df_left, use_container_width=True)
             offer_ids = st.multiselect("Offer player IDs", df_left["player_id"].tolist())
         with col2:
             st.write("Their roster")
-            st.dataframe(df_right, use_container_width=True)
+            if df_right.empty:
+                st.info("That roster is empty (pre‑draft or no players yet).")
+            else:
+                st.dataframe(df_right, use_container_width=True)
             request_ids = st.multiselect("Request player IDs", df_right["player_id"].tolist())
 
         def value(df, ids):
@@ -786,6 +853,7 @@ with tabs[5]:
     st.write("**Run now (manual):**")
     if st.button("Simulate weekly waivers now"):
         st.info("This will compute waiver suggestions using current free agents and preferences. (Submission still requires clicking Approve in Waivers tab.)")
+
 
 
 
