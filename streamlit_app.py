@@ -393,15 +393,15 @@ def render_user_teams(sc, league_key: str):
                 teams_container = entry["teams"]; break
         if teams_container:
             for _, twrap in teams_container.items():
-                if not isinstance(twrap, dict): 
+                if not isinstance(twrap, dict):
                     continue
                 tlist = twrap.get("team")
-                if not isinstance(tlist, list): 
+                if not isinstance(tlist, list):
                     continue
                 info = {"team_key": None, "team_name": None, "league_key_guess": None, "manager": None}
                 for el in tlist:
                     if isinstance(el, dict):
-                        if "team_key" in el: 
+                        if "team_key" in el:
                             info["team_key"] = el["team_key"]
                             parts = el["team_key"].split(".t.")[0] if ".t." in el["team_key"] else None
                             info["league_key_guess"] = parts
