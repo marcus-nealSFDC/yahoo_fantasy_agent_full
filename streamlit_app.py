@@ -1,6 +1,7 @@
 import os, json, time, math
 from pathlib import Path
 from urllib.parse import urlencode
+from datetime import datetime
 
 import requests
 import streamlit as st
@@ -16,6 +17,7 @@ CSEC = os.getenv("YAHOO_CLIENT_SECRET")
 REDIRECT = os.getenv("YAHOO_REDIRECT_URI")
 OAUTH_FILE = Path("oauth2.json")             # token cache (ignored by git)
 PREFS_FILE = Path(".agent_prefs.json")       # simple local prefs
+DATA_DIR = Path("data")
 
 # Optional OpenAI
 OPENAI_OK = False
@@ -114,7 +116,7 @@ def yfs_get(sc, path):
         return r.json()
     except Exception:
         ct = r.headers.get("Content-Type", "")
-        raise RuntimeError(f"Non‑JSON response ({r.status_code}, {ct}). First 400 chars: {body[:400]}")
+        raise RuntimeError(f"Non-JSON response ({r.status_code}, {ct}). First 400 chars: {body[:400]}")
 
 # ─────────────── Parse users→games→leagues (numeric keys) ───────────────
 def parse_games_leagues_v2(raw):
@@ -414,7 +416,7 @@ def render_user_teams(sc, league_key: str):
                     rows.append(info)
 
     if not rows:
-        st.info("No teams found in /users;use_login=1/teams (this is normal if all your leagues are pre‑draft).")
+        st.info("No teams found in /users;use_login=1/teams (this is normal if all your leagues are pre-draft).")
         return
 
     df = pd.DataFrame(rows)
@@ -427,6 +429,272 @@ def render_user_teams(sc, league_key: str):
         st.warning("No team matches the selected league yet. If you haven’t drafted, this is expected.")
     else:
         st.success(f"Found your team for this league: {match.iloc[0]['team_key']}")
+
+# ─────────── AI Snapshot + Summaries + Retrieval ───────────
+def league_current_week(settings_dict: dict) -> int:
+    for k in ("current_week", "week", "standings_week"):
+        v = settings_dict.get(k)
+        if v:
+            try:
+                return int(v)
+            except Exception:
+                pass
+    return 1
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def get_scoreboard(sc, league_key: str, week: int|None=None):
+    try:
+        wk_q = f";week={week}" if week else ""
+        return yfs_get(sc, f"/league/{league_key}/scoreboard{wk_q}?format=json")
+    except Exception:
+        return None
+
+def team_roster_raw(sc, team_key: str):
+    try:
+        T = yfa.Team(sc, team_key)
+        return T.roster() or []
+    except Exception:
+        return []
+
+def snapshot_now(sc, league_key: str, settings: dict, week_override: int|None=None) -> dict:
+    wk = week_override or league_current_week(settings or {})
+    league_dir = DATA_DIR / "league" / league_key / f"week_{wk}"
+    ensure_dir(league_dir)
+
+    # Save settings
+    try:
+        (league_dir / "settings.json").write_text(json.dumps(settings, indent=2))
+    except Exception:
+        pass
+
+    # Scoreboard + find opponent
+    sb = get_scoreboard(sc, league_key, wk) or {}
+    try:
+        (league_dir / "scoreboard.json").write_text(json.dumps(sb, indent=2))
+    except Exception:
+        pass
+
+    you_tk = resolve_team_key(sc, league_key)
+    opp_tk = None
+    your_name = None
+    opp_name = None
+    try:
+        # Parse scoreboard to locate opponent
+        matchups = []
+        fc = sb.get("fantasy_content", {})
+        league = fc.get("league")
+        # league can be list-shaped; find "scoreboard"
+        scoreboard = None
+        if isinstance(league, list):
+            for el in league:
+                if isinstance(el, dict) and "scoreboard" in el:
+                    scoreboard = el["scoreboard"]
+                    break
+        elif isinstance(league, dict):
+            scoreboard = league.get("scoreboard")
+
+        if scoreboard:
+            ms = scoreboard.get("matchups", {})
+            for _, wrap in ms.items():
+                if isinstance(wrap, dict) and "matchup" in wrap:
+                    m = wrap["matchup"]
+                    # each matchup has "teams"
+                    teams_c = None
+                    if isinstance(m, list):
+                        for x in m:
+                            if isinstance(x, dict) and "teams" in x:
+                                teams_c = x["teams"]; break
+                    elif isinstance(m, dict):
+                        teams_c = m.get("teams")
+                    if teams_c:
+                        tkeys = []
+                        tnames = []
+                        for _, tw in teams_c.items():
+                            if isinstance(tw, dict) and "team" in tw:
+                                team = tw["team"]
+                                tk = None; nm = None
+                                if isinstance(team, list):
+                                    for kv in team:
+                                        if isinstance(kv, dict):
+                                            if "team_key" in kv and not tk: tk = kv["team_key"]
+                                            if "name" in kv and not nm: nm = kv["name"]
+                                elif isinstance(team, dict):
+                                    tk = team.get("team_key") or None
+                                    nm = team.get("name") or None
+                                if tk:
+                                    tkeys.append(tk)
+                                    tnames.append(nm or tk)
+                        if you_tk and you_tk in tkeys and len(tkeys) == 2:
+                            idx = tkeys.index(you_tk)
+                            opp_tk = tkeys[1-idx]
+                            your_name = tnames[idx]
+                            opp_name = tnames[1-idx]
+                            break
+    except Exception:
+        pass
+
+    # Your roster + opponent roster
+    your_roster = team_roster_raw(sc, you_tk) if you_tk else []
+    opp_roster = team_roster_raw(sc, opp_tk) if opp_tk else []
+
+    try:
+        (league_dir / "your_roster.json").write_text(json.dumps(your_roster, indent=2))
+    except Exception:
+        pass
+    try:
+        (league_dir / "opp_roster.json").write_text(json.dumps(opp_roster, indent=2))
+    except Exception:
+        pass
+
+    # Transactions (best-effort)
+    try:
+        tx = yfs_get(sc, f"/league/{league_key}/transactions?format=json")
+        (league_dir / "transactions.json").write_text(json.dumps(tx, indent=2))
+    except Exception:
+        tx = {}
+
+    # Free agents snapshot (top N)
+    try:
+        L = yfa.League(sc, league_key)
+        fas = free_agents(L, positions=("WR","RB","TE","QB"), limit=50)
+        (league_dir / "free_agents.json").write_text(json.dumps(fas, indent=2))
+    except Exception:
+        fas = []
+
+    return {
+        "dir": str(league_dir),
+        "week": wk,
+        "you_team_key": you_tk,
+        "opp_team_key": opp_tk,
+        "you_team_name": your_name,
+        "opp_team_name": opp_name,
+        "files": [p.name for p in league_dir.glob("*.json")],
+    }
+
+def _name(p): return p.get("name") if isinstance(p, dict) else None
+def _pts(p): 
+    if isinstance(p, dict):
+        return float(p.get("points") or p.get("proj_points") or 0.0)
+    return 0.0
+
+def summarize_roster(roster_list, title):
+    if not roster_list:
+        return f"{title}: (no players)"
+    ps = sorted(
+        [f"{_name(p)} ({','.join(p.get('eligible_positions', []))}) {_pts(p):.1f}" for p in roster_list if isinstance(p, dict)],
+        key=lambda s: float(s.split()[-1]) if s.split() else 0.0,
+        reverse=True
+    )[:10]
+    return f"{title}: top players → " + "; ".join(ps)
+
+def summarize_transactions(tx_json):
+    try:
+        fc = (tx_json or {}).get("fantasy_content", {})
+        league = fc.get("league")
+        txs = []
+        if isinstance(league, list):
+            for el in league:
+                if isinstance(el, dict) and "transactions" in el:
+                    txs = list(el["transactions"].values())
+                    break
+        elif isinstance(league, dict):
+            txs = list(league.get("transactions", {}).values())
+        names = []
+        for w in txs:
+            if not isinstance(w, dict): 
+                continue
+            t = w.get("transaction")
+            if isinstance(t, list):
+                for kv in t:
+                    if isinstance(kv, dict) and "players" in kv:
+                        for _, pw in kv["players"].items():
+                            if isinstance(pw, dict) and "player" in pw:
+                                pl = pw["player"]
+                                nm = None
+                                if isinstance(pl, list):
+                                    for z in pl:
+                                        if isinstance(z, dict) and "name" in z:
+                                            nm = z["name"].get("full")
+                                elif isinstance(pl, dict):
+                                    nm = pl.get("name", {}).get("full")
+                                if nm:
+                                    names.append(nm)
+        if not names:
+            return "Recent transactions: none found."
+        uniq = []
+        for n in names:
+            if n not in uniq: uniq.append(n)
+        return f"Recent transactions (sample): " + ", ".join(uniq[:10])
+    except Exception:
+        return "Recent transactions: (unavailable)"
+
+def build_context_summaries(snapshot_meta: dict) -> list[str]:
+    league_dir = Path(snapshot_meta["dir"])
+    def read_json(name):
+        p = league_dir / name
+        if p.exists():
+            try: return json.loads(p.read_text())
+            except Exception: return {}
+        return {}
+
+    your = read_json("your_roster.json")
+    opp = read_json("opp_roster.json")
+    tx = read_json("transactions.json")
+    fas = read_json("free_agents.json")
+
+    you_sum = summarize_roster(your, "Your roster")
+    opp_sum = summarize_roster(opp, f"Opponent roster ({snapshot_meta.get('opp_team_name') or 'unknown'})")
+    tx_sum = summarize_transactions(tx)
+    fa_sum = f"Top free agents snapshot: " + "; ".join([f"{p.get('name')} {float(p.get('points') or 0):.1f}" for p in fas[:10]])
+
+    return [you_sum, opp_sum, tx_sum, fa_sum]
+
+def select_context(query: str, summaries: list[str], k: int = 3) -> list[str]:
+    if not query:
+        return summaries[:k]
+    q = query.lower().split()
+    scored = []
+    for s in summaries:
+        score = sum(s.lower().count(tok) for tok in q)
+        scored.append((score, s))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = [s for sc, s in scored if sc > 0][:k]
+    return out or summaries[:k]
+
+def answer_with_ai(question: str, summaries: list[str], structured: dict) -> str:
+    if not OPENAI_OK:
+        return "OpenAI key not configured; cannot run the AI answer. (Set OPENAI_API_KEY and rerun.)"
+    sys = "You are a concise fantasy football assistant. Use the provided CONTEXT to ground your answer. When uncertain, say what additional data you need."
+    ctx = "\n".join(f"- {s}" for s in summaries)
+    struct_txt = json.dumps(structured, ensure_ascii=False)
+    prompt = f"""CONTEXT_SUMMARIES:
+{ctx}
+
+STRUCTURED_SNAPSHOT (JSON):
+{struct_txt}
+
+LIVE_CHECKS:
+- Use logic to verify roster eligibility and positions.
+- Prefer safer picks if injury status is questionable.
+
+QUESTION:
+{question}
+
+ANSWER STYLE:
+- Bullet points first (1–4 bullets), then a short 1–2 sentence recommendation.
+- Be specific and reference players/positions from context when possible."""
+    try:
+        resp = OPENAI_CLIENT.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":sys},{"role":"user","content":prompt}],
+            max_tokens=400,
+            temperature=0.2
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"OpenAI call failed: {e}"
 
 # ───────────────── Sidebar: Connect ─────────────────
 with st.sidebar:
@@ -493,7 +761,7 @@ league_key = league_map[choice]
 # Show user teams table to clarify whether a team exists for this league
 render_user_teams(sc, league_key)
 
-# ─────────────── League status + pre‑draft gate (robust) ───────────────
+# ─────────────── League status + pre-draft gate (robust) ───────────────
 def get_league_settings_safe(sc, league_key: str) -> dict:
     """Robust settings fetch (library first, then raw API)."""
     # 1) Library
@@ -552,9 +820,9 @@ with st.expander("League info", expanded=False):
 # Clear “why no data” explainer
 empty_reasons = []
 if not settings:
-    empty_reasons.append("League settings could not be read (Yahoo may be rate‑limiting or the league is not finalized).")
+    empty_reasons.append("League settings could not be read (Yahoo may be rate-limiting or the league is not finalized).")
 if draft_status in ("predraft", "unknown"):
-    empty_reasons.append("League shows as pre‑draft or unknown; teams/rosters aren’t published yet.")
+    empty_reasons.append("League shows as pre-draft or unknown; teams/rosters aren’t published yet.")
 # Probe teams/roster to refine message
 try:
     L_probe = yfa.League(sc, league_key)
@@ -568,7 +836,7 @@ try:
                 T_probe = yfa.Team(sc, tk_probe)
                 roster_probe = T_probe.roster()
                 if not roster_probe:
-                    empty_reasons.append("Your roster is empty right now (common pre‑draft).")
+                    empty_reasons.append("Your roster is empty right now (common pre-draft).")
             except Exception:
                 empty_reasons.append("Could not fetch your roster (authentication/scope or timing).")
         else:
@@ -599,10 +867,10 @@ if show_raw:
         except Exception as e:
             st.error(f"teams error: {e}")
 
-# PRE‑DRAFT → show only Draft Assistant and STOP
+# PRE-DRAFT → show only Draft Assistant and STOP
 if draft_status != "postdraft":
-    st.info("📝 **Pre‑draft** detected. Roster, Start/Sit, Waivers, Trades, and Scheduler unlock after your draft.")
-    st.subheader("Draft Assistant (Pre‑draft)")
+    st.info("📝 **Pre-draft** detected. Roster, Start/Sit, Waivers, Trades, and Scheduler unlock after your draft.")
+    st.subheader("Draft Assistant (Pre-draft)")
     st.caption("Upload projections/ADP CSV. Required: `name`, `position`, `proj_points`. Optional: `team`, `adp`, `ecr`.")
     uploaded_predraft = st.file_uploader("Upload projections CSV", type=["csv"], key="draft_upload_predraft")
     if uploaded_predraft:
@@ -644,8 +912,8 @@ if draft_status != "postdraft":
         st.info("Tip: export projections from your favorite site and upload here.")
     st.stop()  # hide everything else until postdraft
 
-# POSTDRAFT → show full tabs
-tabs = st.tabs(["Draft Assistant", "Roster", "Start/Sit", "Waivers", "Trades", "Scheduler"])
+# POSTDRAFT → show full tabs (added AI Assistant tab)
+tabs = st.tabs(["Draft Assistant", "Roster", "Start/Sit", "Waivers", "Trades", "AI Assistant", "Scheduler"])
 
 # ───────────────────── Draft Assistant (postdraft tab) ─────────────────────
 with tabs[0]:
@@ -682,12 +950,9 @@ with tabs[0]:
                     ["position","tier","proj_points"], ascending=[True, True, False]
                 )
                 st.dataframe(tiers_df.reset_index(drop=True), use_container_width=True)
-        except Exception as e:
-            st.error(f"Could not read CSV: {e}")
     else:
         st.caption("Upload projections/ADP to populate tiers.")
 
-# ───────────────── Post‑draft tabs ─────────────────
 # 1) Roster
 with tabs[1]:
     st.subheader("Current Roster")
@@ -806,7 +1071,7 @@ with tabs[3]:
 
             st.divider()
             st.write("### Approve & Execute")
-            idx = st.number_input("Row to add (0‑based from table above)", min_value=0, max_value=max(0, len(dfw)-1), value=0)
+            idx = st.number_input("Row to add (0-based from table above)", min_value=0, max_value=max(0, len(dfw)-1), value=0)
             pick = dfw.iloc[int(idx)] if not dfw.empty else None
             drop_pid = st.text_input("Player ID to drop (optional)")
             default_bid = int(pick["suggested_faab"]) if pick is not None else 0
@@ -868,14 +1133,14 @@ with tabs[4]:
         with col1:
             st.write("Your roster")
             if df_left.empty:
-                st.info("Your roster is empty (pre‑draft or Yahoo hasn’t posted teams yet).")
+                st.info("Your roster is empty (pre-draft or Yahoo hasn’t posted teams yet).")
             else:
                 st.dataframe(df_left, use_container_width=True)
             offer_ids = st.multiselect("Offer player IDs", df_left["player_id"].tolist())
         with col2:
             st.write("Their roster")
             if df_right.empty:
-                st.info("That roster is empty (pre‑draft or no players yet).")
+                st.info("That roster is empty (pre-draft or no players yet).")
             else:
                 st.dataframe(df_right, use_container_width=True)
             request_ids = st.multiselect("Request player IDs", df_right["player_id"].tolist())
@@ -895,7 +1160,7 @@ with tabs[4]:
 
         if OPENAI_OK and st.button("Draft a trade pitch (OpenAI)"):
             try:
-                msg = f"We propose trading {offer_ids} for {request_ids}. Our delta {delta_you:+.1f}, their delta {delta_them:+.1f}. Write a friendly, 3‑sentence pitch."
+                msg = f"We propose trading {offer_ids} for {request_ids}. Our delta {delta_you:+.1f}, their delta {delta_them:+.1f}. Write a friendly, 3-sentence pitch."
                 resp = OPENAI_CLIENT.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[{"role":"user","content":msg}],
@@ -905,8 +1170,53 @@ with tabs[4]:
             except Exception as e:
                 st.warning(f"OpenAI not available: {e}")
 
-# 5) Scheduler / Automation
+# 5) AI Assistant (RAG-lite)
 with tabs[5]:
+    st.subheader("AI Assistant (snapshot → summarize → retrieve → answer)")
+
+    wk_guess = league_current_week(settings or {})
+    wk = st.number_input("Week to snapshot", min_value=1, max_value=25, value=wk_guess, step=1)
+    col_a, col_b = st.columns([1,2])
+
+    with col_a:
+        if st.button("📸 Snapshot league data now"):
+            try:
+                meta = snapshot_now(sc, league_key, settings, week_override=int(wk))
+                st.success(f"Snapshot saved under: {meta['dir']}")
+                st.json(meta)
+                st.session_state["_last_snapshot_meta"] = meta
+            except Exception as e:
+                st.error(f"Snapshot failed: {e}")
+
+    with col_b:
+        meta = st.session_state.get("_last_snapshot_meta")
+        if meta:
+            st.caption(f"Using snapshot dir: {meta['dir']}")
+            summaries = build_context_summaries(meta)
+            st.write("**Context summaries (top of mind):**")
+            for s in summaries:
+                st.write("- " + s)
+
+            q = st.text_area("Ask a question (e.g., 'Who should I flex in PPR this week?')", height=80)
+            if st.button("🤖 Ask AI"):
+                chosen = select_context(q, summaries, k=3)
+                structured = {
+                    "league_key": league_key,
+                    "week": meta.get("week"),
+                    "you_team_key": meta.get("you_team_key"),
+                    "opp_team_key": meta.get("opp_team_key"),
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                }
+                ans = answer_with_ai(q, chosen, structured)
+                st.markdown("### Answer")
+                st.write(ans)
+                with st.expander("Context used"):
+                    st.write(chosen)
+        else:
+            st.info("Take a snapshot first to build context.")
+
+# 6) Scheduler / Automation
+with tabs[6]:
     st.subheader("Scheduler / Automation")
     st.caption("These are preferences the agent will use. To fully automate, trigger a daily script (cron, GitHub Action, or Cloud Scheduler) that reads this file and calls the same functions.")
     prefs = {"auto_lineup": False, "auto_waivers": False, "waiver_budget_cap": 25, "aggression": 0.15}
@@ -929,4 +1239,5 @@ with tabs[5]:
     st.write("**Run now (manual):**")
     if st.button("Simulate weekly waivers now"):
         st.info("This will compute waiver suggestions using current free agents and preferences. (Submission still requires clicking Approve in Waivers tab.)")
+
 
