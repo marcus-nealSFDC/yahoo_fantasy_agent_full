@@ -1324,5 +1324,3 @@ with tabs[6]:
     st.write("**Run now (manual):**")
     if st.button("Simulate weekly waivers now"):
         st.info("This will compute waiver suggestions using current free agents and preferences. (Submission still requires clicking Approve in Waivers tab.)")
-
-
