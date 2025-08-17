@@ -13,12 +13,16 @@ import yahoo_fantasy_api as yfa
 import uuid
 from typing import Any, Dict, List, Optional
 
+# ───────────────── Setup base dirs ─────────────────
+DATA_DIR = Path("data")
+
 LOG_DIR = Path(os.getenv("LOG_DIR", DATA_DIR / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Optional S3 mirroring for logs
-LOG_S3_BUCKET = os.getenv("LOG_S3_BUCKET", os.getenv("AWS_S3_BUCKET", ""))  # reuse S3 bucket if you like
-LOG_S3_PREFIX = os.getenv("LOG_S3_PREFIX", "logs/")  # e.g., "logs/" or "fantasy-agent/logs/"
+LOG_S3_BUCKET = os.getenv("LOG_S3_BUCKET", os.getenv("AWS_S3_BUCKET", ""))  
+LOG_S3_PREFIX = os.getenv("LOG_S3_PREFIX", "logs/")
+
 
 
 # ────────────────────────────── Setup ──────────────────────────────
