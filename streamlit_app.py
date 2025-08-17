@@ -9,6 +9,17 @@ import pandas as pd
 from dotenv import load_dotenv
 from yahoo_oauth import OAuth2
 import yahoo_fantasy_api as yfa
+# ───────────────── Logging config ─────────────────
+import uuid
+from typing import Any, Dict, List, Optional
+
+LOG_DIR = Path(os.getenv("LOG_DIR", DATA_DIR / "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Optional S3 mirroring for logs
+LOG_S3_BUCKET = os.getenv("LOG_S3_BUCKET", os.getenv("AWS_S3_BUCKET", ""))  # reuse S3 bucket if you like
+LOG_S3_PREFIX = os.getenv("LOG_S3_PREFIX", "logs/")  # e.g., "logs/" or "fantasy-agent/logs/"
+
 
 # ────────────────────────────── Setup ──────────────────────────────
 load_dotenv()
@@ -370,6 +381,34 @@ def execute_add_drop(sc, league_key: str, add_pid: str, drop_pid: str|None=None,
 
     return {"status": "error", "details": last_err or "No supported add/waiver method found."}
 
+def _iter_recent_log_files(days: int = 30) -> List[Path]:
+    out = []
+    today = datetime.utcnow()
+    for d in range(days):
+        day = (today - pd.Timedelta(days=d)).strftime("%Y-%m-%d")
+        p = _local_log_path_for_day(day)
+        if p.exists():
+            out.append(p)
+    return out
+
+def read_logs_local(days: int = 30, limit: int = 2000) -> List[Dict[str, Any]]:
+    files = _iter_recent_log_files(days)
+    rows = []
+    for p in files:
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip(): continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    # newest first
+    rows.sort(key=lambda r: r.get("ts",""), reverse=True)
+    return rows[:limit]
+
 # ───────── Extra diag: list all user teams and highlight match ─────────
 def render_user_teams(sc, league_key: str):
     """Show all teams for the logged-in user and highlight the one in this league."""
@@ -443,6 +482,110 @@ def league_current_week(settings_dict: dict) -> int:
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+def _json_default(o):
+    try:
+        # numpy/pandas scalars
+        if hasattr(o, "item"):
+            return o.item()
+    except Exception:
+        pass
+    try:
+        return str(o)
+    except Exception:
+        return None
+
+def _safe_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return json.loads(json.dumps(d, default=_json_default))
+    except Exception:
+        # best-effort fallback
+        out = {}
+        for k, v in (d or {}).items():
+            try:
+                json.dumps(v, default=_json_default)
+                out[k] = v
+            except Exception:
+                out[k] = str(v)
+        return out
+
+def _local_log_path_for_day(day: Optional[str] = None) -> Path:
+    # one JSONL file per day: YYYY-MM-DD.jsonl
+    day = day or datetime.utcnow().strftime("%Y-%m-%d")
+    return LOG_DIR / f"{day}.jsonl"
+
+def _append_jsonl_local(record: Dict[str, Any]):
+    p = _local_log_path_for_day()
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=_json_default) + "\n")
+
+def _put_s3_log_record(record: Dict[str, Any]):
+    if not (AWS_OK and LOG_S3_BUCKET):
+        return
+    try:
+        # one object per record (easy, no S3 "append" games)
+        ts = record.get("ts") or datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
+        day = (record.get("ts") or "").split("T")[0] or datetime.utcnow().strftime("%Y-%m-%d")
+        rid = record.get("id") or str(uuid.uuid4())
+        key = f"{LOG_S3_PREFIX}{day}/{ts}-{rid}.json"
+        boto3.client("s3", region_name=AWS_REGION).put_object(
+            Bucket=LOG_S3_BUCKET, Key=key,
+            Body=json.dumps(record, default=_json_default).encode("utf-8"),
+            ContentType="application/json"
+        )
+    except Exception as e:
+        # don't crash UI on logging errors—best-effort only
+        st.caption(f"S3 log mirror failed: {e}")
+
+def log_event(kind: str,
+              league_key: Optional[str] = None,
+              week: Optional[int] = None,
+              data: Optional[Dict[str, Any]] = None,
+              ai: Optional[Dict[str, Any]] = None):
+    """
+    Durable log for both 'memory' and audit trail.
+    kind examples:
+      - 'ai.qa' (question→context→answer)
+      - 'snapshot' (snapshot metadata)
+      - 'waiver.approved' (executed add/drop)
+      - 'lineup.reco' (our start/sit recommendation)
+    """
+    record = {
+        "id": str(uuid.uuid4()),
+        "ts": _utc_now_iso(),
+        "kind": kind,
+        "league_key": league_key,
+        "week": week,
+        "data": _safe_dict(data or {}),
+        "ai": _safe_dict(ai or {}),
+        # space for future user/profile metadata if multi-user
+        "app_version": "live-0.1",
+    }
+    try:
+        _append_jsonl_local(record)
+    except Exception as e:
+        st.caption(f"Local log write failed: {e}")
+    _put_s3_log_record(record)
+
+def log_ai_qa(league_key: Optional[str],
+              question: str,
+              context: List[str],
+              answer: str,
+              structured: Dict[str, Any],
+              model: str = "gpt-4o-mini",
+              mode: str = "assistant"):
+    ai = {
+        "mode": mode,
+        "model": model,
+        "question": question,
+        "context": context,
+        "answer": answer,
+        "structured": _safe_dict(structured),
+    }
+    log_event(kind="ai.qa", league_key=league_key, week=structured.get("week"), ai=ai)
+    
 
 def get_scoreboard(sc, league_key: str, week: int|None=None):
     try:
@@ -534,6 +677,7 @@ def snapshot_now(sc, league_key: str, settings: dict, week_override: int|None=No
                             break
     except Exception:
         pass
+    
 
     # Your roster + opponent roster
     your_roster = team_roster_raw(sc, you_tk) if you_tk else []
@@ -663,9 +807,14 @@ def select_context(query: str, summaries: list[str], k: int = 3) -> list[str]:
     out = [s for sc, s in scored if sc > 0][:k]
     return out or summaries[:k]
 
-def answer_with_ai(question: str, summaries: list[str], structured: dict) -> str:
+def answer_with_ai(question: str, summaries: list[str], structured: dict,
+                   league_key: Optional[str] = None, mode: str = "assistant") -> str:
     if not OPENAI_OK:
-        return "OpenAI key not configured; cannot run the AI answer. (Set OPENAI_API_KEY and rerun.)"
+        ans = "OpenAI key not configured; cannot run the AI answer. (Set OPENAI_API_KEY and rerun.)"
+        # still log the question so we retain memory of what was asked
+        log_ai_qa(league_key, question, summaries, ans, structured, model="(missing)", mode=mode)
+        return ans
+
     sys = "You are a concise fantasy football assistant. Use the provided CONTEXT to ground your answer. When uncertain, say what additional data you need."
     ctx = "\n".join(f"- {s}" for s in summaries)
     struct_txt = json.dumps(structured, ensure_ascii=False)
@@ -692,9 +841,15 @@ ANSWER STYLE:
             max_tokens=400,
             temperature=0.2
         )
-        return resp.choices[0].message.content.strip()
+        ans = resp.choices[0].message.content.strip()
+        # durable memory: AI Q&A
+        log_ai_qa(league_key, question, summaries, ans, structured, model="gpt-4o-mini", mode=mode)
+        return ans
     except Exception as e:
-        return f"OpenAI call failed: {e}"
+        ans = f"OpenAI call failed: {e}"
+        log_ai_qa(league_key, question, summaries, ans, structured, model="gpt-4o-mini", mode=mode)
+        return ans
+
 
 # ───────────────── Sidebar: Connect ─────────────────
 with st.sidebar:
@@ -981,8 +1136,10 @@ if draft_status != "postdraft":
                         summaries.append(f"CSV summaries unavailable (parse issue: {e})")
 
                     chosen = select_context(q, summaries, k=3)
-                    structured = {"mode": "predraft", "rows": int(len(dfp))}
-                    ans = answer_with_ai(q, chosen, structured)
+                    structured = {
+                        "mode": "predraft", "rows": int(len(dfp))}
+                    ans = answer_with_ai(q, chosen, {"mode": "predraft", "rows": int(len(dfp))},
+                     league_key=None, mode="predraft")
                     st.markdown("### AI Answer")
                     st.write(ans)
 
@@ -995,7 +1152,8 @@ if draft_status != "postdraft":
 
     
 # POSTDRAFT → show full tabs (added AI Assistant tab)
-tabs = st.tabs(["Draft Assistant", "Roster", "Start/Sit", "Waivers", "Trades", "AI Assistant", "Scheduler"])
+tabs = st.tabs(["Draft Assistant", "Roster", "Start/Sit", "Waivers", "Trades", "AI Assistant", "Scheduler", "Logs"])
+
 
 # ───────────────────── Draft Assistant (postdraft tab) ─────────────────────
 with tabs[0]:
@@ -1086,7 +1244,23 @@ with tabs[2]:
             starters.append((slot, pick))
             used.add(pick["player_id"])
         bench = pool[~pool["player_id"].isin(used)].sort_values("score", ascending=False)
-
+        if st.button("Log this recommendation"):
+            try:
+                starters_payload = [{"slot":slot,
+                                     "player_id": p["player_id"] ,
+                                     "name": p["name"],
+                                     "score": float(p["score"]),
+                                     "status": p["status"]}
+                                    for slot, p in starters]                                
+                bench_payload = [{"player_id": r["player_id"], "name": r["name"], "score": float(r["score"]), "status": r["status"]}
+                         for _, r in bench.head(10).iterrows()]
+                log_event("lineup.reco",
+                  league_key=league_key,
+                  week=league_current_week(settings_full or {}),
+                  data={"starters": starters_payload, "bench_top10": bench_payload})
+                st.success("Recommendation logged")
+            except Exception as _e:
+                st.caption(f"Logging (lineup.reco) failed: {_e}")
         st.write("### Starters")
         for slot, p in starters:
             st.write(f"- **{slot}** → {p['name']} (score: {p['score']:.1f}, status: {p['status']})")
@@ -1169,10 +1343,25 @@ with tabs[3]:
                     if result.get("status") == "ok":
                         st.success("Transaction submitted ✅")
                         st.json(result.get("details"))
+                        try:
+                            #include the selected pick row & action info
+                            pick_dict = _safe_dict({k: (v.item() if hasattr(v, "item") else v) for k, v in pick.to_dict().items()})
+                            log_event("waiver.approved",
+                                    league_key=league_key,
+                                    week=league_current_week(settings or {}),
+                                    data={
+                                        "add_player": pick_dict,
+                                        "drop_player_id": (drop_pid or None),
+                                        "faab_bid": int(faab_bid) if faab_bid else None,
+                                        "result": _safe_dict(result),
+                                    })
+                        except Exception as _e:
+                            st.caption(f"Logging (waiver.approved) failed: {_e}")
                     else:
                         st.error("Transaction failed"); st.json(result)
                 except Exception as e:
                     st.error(f"Execution error: {e}")
+
 
 # 4) Trades (Evaluator)
 with tabs[4]:
@@ -1270,8 +1459,13 @@ with tabs[5]:
                 st.success(f"Snapshot saved under: {meta['dir']}")
                 st.json(meta)
                 st.session_state["_last_snapshot_meta"] = meta
+                try:
+                    log_event("snapshot", league_key=league_key, week=int(meta.get("week") or 0), data=_safe_dict(meta))
+                except Exception as _e:
+                    st.caption(f"Snapshot logging failed: {_e}")
             except Exception as e:
                 st.error(f"Snapshot failed: {e}")
+
 
     with col_b:
         meta = st.session_state.get("_last_snapshot_meta")
@@ -1292,7 +1486,7 @@ with tabs[5]:
                     "opp_team_key": meta.get("opp_team_key"),
                     "timestamp": datetime.utcnow().isoformat() + "Z",
                 }
-                ans = answer_with_ai(q, chosen, structured)
+                ans = answer_with_ai(q, chosen, structured, league_key=league_key, mode="assistant")
                 st.markdown("### Answer")
                 st.write(ans)
                 with st.expander("Context used"):
@@ -1324,3 +1518,89 @@ with tabs[6]:
     st.write("**Run now (manual):**")
     if st.button("Simulate weekly waivers now"):
         st.info("This will compute waiver suggestions using current free agents and preferences. (Submission still requires clicking Approve in Waivers tab.)")
+
+with tabs[7]:
+    st.subheader("Logs")
+
+    # Filters
+    kinds_all = ["ai.qa", "snapshot", "waiver.approved", "lineup.reco"]
+    colf1, colf2, colf3, colf4 = st.columns([1.3, 1, 1, 1])
+    with colf1:
+        kind_filter = st.multiselect("Kinds", kinds_all, default=kinds_all)
+    with colf2:
+        league_opts = ["(All)"] + [league_key]
+        league_pick = st.selectbox("League", league_opts, index=(0 if len(league_opts) > 1 else 0))
+    with colf3:
+        week_pick = st.text_input("Week (optional)", "")
+    with colf4:
+        days_back = st.number_input("Days back", min_value=1, max_value=120, value=30)
+
+    logs = read_logs_local(days=int(days_back), limit=4000)
+    # Apply filters
+    if kind_filter:
+        logs = [r for r in logs if r.get("kind") in kind_filter]
+    if league_pick and league_pick != "(All)":
+        logs = [r for r in logs if r.get("league_key") == league_pick]
+    if week_pick.strip():
+        try:
+            wv = int(week_pick.strip())
+            logs = [r for r in logs if (r.get("week") == wv)]
+        except Exception:
+            st.caption("Week filter ignored (not an int)")
+
+    # Split feeds
+    ai_logs = [r for r in logs if r.get("kind") == "ai.qa"]
+    evt_logs = [r for r in logs if r.get("kind") != "ai.qa"]
+
+    st.markdown("### AI Q&A feed")
+    if not ai_logs:
+        st.caption("No AI logs yet.")
+    else:
+        for r in ai_logs[:200]:
+            ai = r.get("ai") or {}
+            q = (ai.get("question") or "")[:120]
+            with st.expander(f"{r.get('ts')} • {r.get('league_key') or '(no league)'} • Q: {q}…"):
+                st.write("**Question:**", ai.get("question"))
+                st.write("**Context used:**")
+                for c in ai.get("context") or []:
+                    st.write("- " + str(c))
+                st.write("**Answer:**")
+                st.write(ai.get("answer"))
+                with st.expander("Structured snapshot"):
+                    st.json(ai.get("structured") or {})
+                st.caption(f"model={ai.get('model')}  |  mode={ai.get('mode')}  |  week={r.get('week')}")
+
+    st.markdown("### Events feed")
+    if not evt_logs:
+        st.caption("No events yet.")
+    else:
+        # Build a compact table
+        rows = []
+        for r in evt_logs[:500]:
+            kind = r.get("kind")
+            summary = ""
+            if kind == "snapshot":
+                meta = r.get("data") or {}
+                summary = f"dir={meta.get('dir')} files={len(meta.get('files', []))} opp={meta.get('opp_team_name')}"
+            elif kind == "waiver.approved":
+                dd = r.get("data") or {}
+                addn = ((dd.get("add_player") or {}).get("name")) or "<unknown>"
+                bid = dd.get("faab_bid")
+                drp = dd.get("drop_player_id")
+                summary = f"ADD {addn}  BID {bid}  DROP {drp}"
+            elif kind == "lineup.reco":
+                dd = r.get("data") or {}
+                starters = dd.get("starters") or []
+                names = ", ".join([s.get("name") for s in starters[:6]])
+                summary = f"{len(starters)} starters → {names}"
+            rows.append({
+                "ts": r.get("ts"),
+                "kind": kind,
+                "league": r.get("league_key"),
+                "week": r.get("week"),
+                "summary": summary
+            })
+        if rows:
+            df_logs = pd.DataFrame(rows)
+            st.dataframe(df_logs, use_container_width=True)
+        
