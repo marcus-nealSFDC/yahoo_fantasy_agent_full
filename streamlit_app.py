@@ -1075,7 +1075,7 @@ if draft_status != "postdraft":
     st.stop()
 
 # POSTDRAFT → full tabs
-tabs = st.tabs(["Draft Assistant", "Roster", "Start/Sit", "Waivers", "Trades", "AI Assistant", "Scheduler", "Logs"])
+tabs = st.tabs(["Draft Assistant", "Roster", "Start/Sit", "Waivers", "Trades", "AI Assistant", "Opponent Scouting","Scheduler", "Logs"])
 
 # ───────────────── Draft Assistant (postdraft) ─────────────────
 with tabs[0]:
@@ -1344,6 +1344,235 @@ with tabs[4]:
                 st.info(resp.choices[0].message.content.strip())
             except Exception as e:
                 st.warning(f"OpenAI not available: {e}")
+
+# ───────────────── Opponent Scouting (tab) ─────────────────
+with tabs[4]:
+    st.subheader("Opponent Scouting")
+
+    # --- helper: find current opponent (this week) ---
+    def _get_current_opponent(sc, league_key: str, settings: dict):
+        """Return (you_team_key, you_name, opp_team_key, opp_name) or (None,..) if not found."""
+        you_tk = resolve_team_key(sc, league_key)
+        opp_tk = your_name = opp_name = None
+        sb = get_scoreboard(sc, league_key, league_current_week(settings or {})) or {}
+        try:
+            fc = (sb or {}).get("fantasy_content", {})
+            league = fc.get("league")
+            scoreboard = None
+            if isinstance(league, list):
+                for el in league:
+                    if isinstance(el, dict) and "scoreboard" in el:
+                        scoreboard = el["scoreboard"]; break
+            elif isinstance(league, dict):
+                scoreboard = league.get("scoreboard")
+            if scoreboard:
+                ms = scoreboard.get("matchups", {})
+                for _, wrap in ms.items():
+                    if isinstance(wrap, dict) and "matchup" in wrap:
+                        m = wrap["matchup"]
+                        teams_c = None
+                        if isinstance(m, list):
+                            for x in m:
+                                if isinstance(x, dict) and "teams" in x:
+                                    teams_c = x["teams"]; break
+                        elif isinstance(m, dict):
+                            teams_c = m.get("teams")
+                        if teams_c:
+                            tkeys, tnames = [], []
+                            for _, tw in teams_c.items():
+                                if isinstance(tw, dict) and "team" in tw:
+                                    team = tw["team"]
+                                    tk = nm = None
+                                    if isinstance(team, list):
+                                        for kv in team:
+                                            if isinstance(kv, dict):
+                                                if "team_key" in kv and not tk: tk = kv["team_key"]
+                                                if "name" in kv and not nm: nm = kv["name"]
+                                    elif isinstance(team, dict):
+                                        tk = team.get("team_key")
+                                        nm = team.get("name")
+                                    if tk:
+                                        tkeys.append(tk); tnames.append(nm or tk)
+                            if you_tk and you_tk in tkeys and len(tkeys) == 2:
+                                idx = tkeys.index(you_tk)
+                                return you_tk, tnames[idx], tkeys[1-idx], tnames[1-idx]
+        except Exception:
+            pass
+        return you_tk, None, None, None
+
+    # --- helpers for optimizer/deltas on opponent roster ---
+    def _list_to_df(roster_list):
+        rows = []
+        for p in roster_list or []:
+            elig = p.get("eligible_positions") or []
+            if isinstance(elig, list): elig = ",".join(elig)
+            rows.append({
+                "player_id": p.get("player_id"),
+                "name": p.get("name"),
+                "status": p.get("status"),
+                "eligible_positions": elig or "",
+                "selected_position": p.get("selected_position"),
+                "points": (p.get("points") or p.get("proj_points") or 0)
+            })
+        return pd.DataFrame(rows)
+
+    def _slots_from_settings(settings_dict: dict):
+        slots = []
+        for rp in (settings_dict or {}).get("roster_positions", []):
+            pos, cnt = rp.get("position"), int(rp.get("count", 0))
+            if pos and cnt > 0: slots += [pos]*cnt
+        return slots
+
+    # identify opponent
+    you_tk, your_name, opp_tk, opp_name = _get_current_opponent(sc, league_key, settings)
+    if not opp_tk:
+        st.info("Couldn’t identify your current opponent yet (common pre-draft or before schedule is posted).")
+        st.stop()
+
+    # pull live data
+    your_roster = team_roster_raw(sc, you_tk) if you_tk else []
+    opp_roster  = team_roster_raw(sc, opp_tk) if opp_tk else []
+
+    try:
+        L = yfa.League(sc, league_key)
+        fa_pool = free_agents(L, positions=("WR","RB","TE","QB","DEF","K"), limit=80)
+    except Exception:
+        fa_pool = []
+
+    # opponent weak spots + block moves (utils)
+    rep = scout_weak_spots(opp_roster)              # expects {"weak": [...], "counts": {...}, ...}
+    blocks = recommend_blocks(rep.get("weak", []), fa_pool)
+
+    # Optional signals.csv just for opponent optimizer (independent of Start/Sit tab)
+    st.caption("Optional: upload a signals CSV to enrich opponent projections (must include player_id).")
+    sig_file_opp = st.file_uploader("Upload opponent signals CSV", type=["csv"], key="signals_upload_opp")
+    signals_opp = {}
+    if sig_file_opp is not None:
+        try:
+            sdf = pd.read_csv(sig_file_opp)
+            cols_lower = {c.lower(): c for c in sdf.columns}
+            if "player_id" in cols_lower:
+                pid_col = cols_lower["player_id"]
+                for _, r in sdf.iterrows():
+                    pid = str(r[pid_col])
+                    if pid and pid != "nan":
+                        signals_opp[pid] = {k: r[k] for k in sdf.columns if k != pid_col}
+                st.success(f"Loaded {len(signals_opp)} signal rows for opponent enrichment.")
+            else:
+                st.warning("Signals CSV must include a 'player_id' column.")
+        except Exception as e:
+            st.warning(f"Could not read uploaded signals CSV: {e}")
+
+    # opponent optimizer: what *they* should start
+    st.markdown(f"**You:** {your_name or you_tk}  |  **Opponent:** {opp_name or opp_tk}")
+    opp_df = _list_to_df(opp_roster)
+    slots = _slots_from_settings(settings or league_settings(sc, league_key))
+
+    if opp_df.empty or not slots:
+        st.info("Opponent roster or league slots not available yet.")
+    else:
+        # apply enrichment & optimize (reuse the same optimizer API you use)
+        opp_pool_enriched = apply_enrichment(opp_df.copy(), signals_opp or {})
+        picks, opp_bench = optimize_lineup(opp_pool_enriched.copy(), slots)
+
+        # compute deltas vs current opponent starters
+        gained, benched = lineup_change_deltas(opp_df, picks)
+
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("**Opponent optimal starters (our estimate)**")
+            rows = []
+            for slot, p in picks:
+                rows.append({
+                    "slot": slot,
+                    "player_id": p["player_id"],
+                    "name": p["name"],
+                    "status": p.get("status"),
+                    "eligible_positions": p.get("eligible_positions"),
+                    "est_score": float(p.get("score") if "score" in p else p.get("points", 0) or 0)
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+        with colB:
+            st.markdown("**Opponent bench (best → worst)**")
+            st.dataframe(opp_bench[["player_id","name","eligible_positions","status","score"]].head(12), use_container_width=True)
+
+        st.markdown("### Change deltas (if they optimize)")
+        colC, colD = st.columns(2)
+        with colC:
+            st.write("**Players they would add to starting lineup**")
+            if gained:
+                st.dataframe(opp_df[opp_df["player_id"].isin(gained)][["player_id","name","eligible_positions","status","points"]], use_container_width=True)
+            else:
+                st.caption("No upgrades vs current starters detected.")
+        with colD:
+            st.write("**Players they would bench**")
+            if benched:
+                st.dataframe(opp_df[opp_df["player_id"].isin(benched)][["player_id","name","eligible_positions","status","points"]], use_container_width=True)
+            else:
+                st.caption("No benches detected.")
+
+    st.divider()
+    st.markdown("### Weak spots & Block Moves")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Opponent weak spots**")
+        st.json(rep)
+    with col2:
+        st.markdown("**Recommended blocks (top)**")
+        if blocks:
+            df_blocks = pd.DataFrame(blocks)
+            st.dataframe(df_blocks, use_container_width=True)
+        else:
+            st.info("No obvious block opportunities right now.")
+
+    st.divider()
+    st.markdown("### Quick Block Waiver")
+    if not fa_pool:
+        st.caption("Free agents list empty or unavailable.")
+    else:
+        pick_opts = []
+        if blocks:
+            for b in blocks[:15]:
+                pick_opts.append(f"{b.get('player_id')} — {b.get('name')} ({b.get('pos') or b.get('position')})")
+        add_choice = st.selectbox("Pick a block target", pick_opts) if pick_opts else ""
+        add_pid_default = (add_choice.split(" — ")[0] if add_choice else "")
+        add_pid = st.text_input("Player ID to add", value=add_pid_default)
+
+        drop_pid = st.text_input("Player ID to drop (optional)")
+        faab_budget = settings.get("faab_budget") or 100
+        faab_bid = st.number_input("FAAB bid", min_value=0, max_value=300, value=min(7, int(faab_budget*0.07)))
+
+        if st.button("Place block as waiver"):
+            if not add_pid.strip():
+                st.warning("Provide a player_id to add.")
+            else:
+                try:
+                    result = execute_add_drop(sc, league_key, add_pid=str(add_pid).strip(),
+                                              drop_pid=(drop_pid.strip() or None),
+                                              faab_bid=int(faab_bid))
+                    if result.get("status") == "ok":
+                        st.success("Block waiver submitted ✅")
+                        st.json(result.get("details"))
+                        try:
+                            log_event("waiver.approved",
+                                      league_key=league_key,
+                                      week=league_current_week(settings or {}),
+                                      data={
+                                          "add_player": {"player_id": add_pid},
+                                          "drop_player_id": (drop_pid or None),
+                                          "faab_bid": int(faab_bid),
+                                          "result": _safe_dict(result),
+                                          "reason": "opponent_block"
+                                      })
+                        except Exception as _e:
+                            st.caption(f"Logging (waiver.approved) failed: {_e}")
+                    else:
+                        st.error("Transaction failed"); st.json(result)
+                except Exception as e:
+                    st.error(f"Execution error: {e}")
+
+
 
 # ───────────────── AI Assistant (RAG-lite) ─────────────────
 with tabs[5]:
