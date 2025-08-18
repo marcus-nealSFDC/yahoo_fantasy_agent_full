@@ -1074,8 +1074,20 @@ if draft_status != "postdraft":
         st.info("Tip: export projections from your favorite site and upload here.")
     st.stop()
 
-# POSTDRAFT → full tabs
-tabs = st.tabs(["Draft Assistant", "Roster", "Start/Sit", "Waivers", "Trades", "AI Assistant", "Opponent Scouting","Scheduler", "Logs"])
+# ───────────────────────────────────────────────────────────
+# POSTDRAFT → full tabs (fixed indices)
+tabs = st.tabs([
+    "Draft Assistant",      # 0
+    "Roster",               # 1
+    "Start/Sit",            # 2
+    "Waivers",              # 3
+    "Opponent",             # 4  ← simple overview
+    "Trades",               # 5
+    "AI Assistant",         # 6
+    "Opponent Scouting",    # 7  ← optimizer + signals uploader
+    "Scheduler",            # 8
+    "Logs"                  # 9
+])
 
 # ───────────────── Draft Assistant (postdraft) ─────────────────
 with tabs[0]:
@@ -1122,7 +1134,19 @@ with tabs[1]:
     else:
         st.dataframe(df_roster, use_container_width=True)
 
-# ───────────────── Start/Sit (Optimizer v1.5 + signals.csv) ─────────────────
+# ───── shared helper for lineup deltas (moved to module scope) ─────
+def lineup_change_deltas(current_df: pd.DataFrame, picks: list[tuple[str,pd.Series]]):
+    want = set([p["player_id"] for _, p in picks])
+    now_starters = set()
+    for _, r in (current_df or pd.DataFrame()).iterrows():
+        sel = (r.get("selected_position") or "").upper()
+        if sel and sel not in ("BN","IR","NA",""):
+            now_starters.add(r["player_id"])
+    gained = list(want - now_starters)
+    benched = list(now_starters - want)
+    return gained, benched
+
+# ───────────────── Start/Sit (Optimizer v1.5 + optional signals) ─────────────────
 with tabs[2]:
     st.subheader("Recommended Starters (optimizer v1.5)")
 
@@ -1139,23 +1163,37 @@ with tabs[2]:
     if pool_df.empty:
         st.info("No roster found (Yahoo may still be finalizing teams).")
     else:
-        # Optional signals.csv (player_id keyed)
+        # Optional signals.csv (player_id keyed) via local path OR upload
         signals = {}
-        sig_path = st.text_input("Signals CSV path (optional)", value="signals.csv")
-        if sig_path and Path(sig_path).exists():
-            try:
+
+        st.markdown("**Optional signals for optimizer**")
+        sig_col1, sig_col2 = st.columns([1,1])
+        with sig_col1:
+            sig_path = st.text_input("Signals CSV path (optional)", value="signals.csv")
+        with sig_col2:
+            sig_file = st.file_uploader("...or upload signals CSV", type=["csv"], key="signals_upload_startsit")
+
+        try:
+            if sig_file is not None:
+                s = pd.read_csv(sig_file)
+            elif sig_path and Path(sig_path).exists():
                 s = pd.read_csv(sig_path)
-                # normalize to str player_id keys
-                for _, r in s.iterrows():
-                    pid = str(r.get("player_id"))
-                    if not pid or pid == "nan": 
-                        continue
-                    signals[pid] = {
-                        k: r[k] for k in s.columns if k != "player_id"
-                    }
-                st.success(f"Loaded {len(signals)} signals from {sig_path}")
-            except Exception as e:
-                st.warning(f"Could not read signals CSV: {e}")
+            else:
+                s = None
+
+            if s is not None:
+                cols_lower = {c.lower(): c for c in s.columns}
+                pid_col = cols_lower.get("player_id")
+                if pid_col:
+                    for _, r in s.iterrows():
+                        pid = str(r[pid_col])
+                        if pid and pid != "nan":
+                            signals[pid] = {k: r[k] for k in s.columns if k != pid_col}
+                    st.success(f"Loaded {len(signals)} signals" + (" from upload" if sig_file is not None else f" from {sig_path}"))
+                else:
+                    st.warning("Signals CSV must include a 'player_id' column.")
+        except Exception as e:
+            st.warning(f"Could not read signals CSV: {e}")
 
         # Use your utils: apply_enrichment + optimize_lineup
         enriched_pool = apply_enrichment(pool_df.copy(), signals or {})
@@ -1171,18 +1209,6 @@ with tabs[2]:
         st.write("### Bench (top 10 by score if provided)")
         if isinstance(bench_df, pd.DataFrame) and not bench_df.empty:
             st.dataframe(bench_df.head(10), use_container_width=True)
-
-        # Deltas vs current lineup
-        def lineup_change_deltas(current_df: pd.DataFrame, picks: list[tuple[str,pd.Series]]):
-            want = set([p["player_id"] for _, p in picks])
-            now_starters = set()
-            for _, r in (current_df or pd.DataFrame()).iterrows():
-                sel = (r.get("selected_position") or "").upper()
-                if sel and sel not in ("BN","IR","NA",""):
-                    now_starters.add(r["player_id"])
-            gained = list(want - now_starters)
-            benched = list(now_starters - want)
-            return gained, benched
 
         gained, benched = lineup_change_deltas(pool_df, starters)
         with st.expander("Change deltas vs current lineup"):
@@ -1264,8 +1290,82 @@ with tabs[3]:
                 except Exception as e:
                     st.error(f"Execution error: {e}")
 
-# ───────────────── Trades (Evaluator) ─────────────────
+# ───────────────── Opponent (overview) ─────────────────
 with tabs[4]:
+    st.subheader("Opponent (Overview)")
+    def _get_current_opponent(sc, league_key: str, settings: dict):
+        you_tk = resolve_team_key(sc, league_key)
+        opp_tk = your_name = opp_name = None
+        sb = get_scoreboard(sc, league_key, league_current_week(settings or {})) or {}
+        try:
+            fc = (sb or {}).get("fantasy_content", {})
+            league = fc.get("league")
+            scoreboard = league.get("scoreboard") if isinstance(league, dict) else None
+            if not scoreboard and isinstance(league, list):
+                for el in league:
+                    if isinstance(el, dict) and "scoreboard" in el:
+                        scoreboard = el["scoreboard"]; break
+            if scoreboard:
+                ms = scoreboard.get("matchups", {})
+                for _, wrap in ms.items():
+                    if isinstance(wrap, dict) and "matchup" in wrap:
+                        m = wrap["matchup"]
+                        teams_c = m.get("teams") if isinstance(m, dict) else None
+                        if not teams_c and isinstance(m, list):
+                            for x in m:
+                                if isinstance(x, dict) and "teams" in x:
+                                    teams_c = x["teams"]; break
+                        if teams_c:
+                            tkeys, tnames = [], []
+                            for _, tw in teams_c.items():
+                                if isinstance(tw, dict) and "team" in tw:
+                                    team = tw["team"]
+                                    tk = nm = None
+                                    if isinstance(team, dict):
+                                        tk = team.get("team_key"); nm = team.get("name")
+                                    elif isinstance(team, list):
+                                        for kv in team:
+                                            if isinstance(kv, dict):
+                                                if "team_key" in kv and not tk: tk = kv["team_key"]
+                                                if "name" in kv and not nm: nm = kv["name"]
+                                    if tk:
+                                        tkeys.append(tk); tnames.append(nm or tk)
+                            you_tk_local = you_tk
+                            if you_tk_local and you_tk_local in tkeys and len(tkeys) == 2:
+                                idx = tkeys.index(you_tk_local)
+                                return you_tk_local, tnames[idx], tkeys[1-idx], tnames[1-idx]
+        except Exception:
+            pass
+        return you_tk, None, None, None
+
+    you_tk, your_name, opp_tk, opp_name = _get_current_opponent(sc, league_key, settings)
+    if not opp_tk:
+        st.info("Couldn’t identify your current opponent yet.")
+    else:
+        st.markdown(f"**You:** {your_name or you_tk}  |  **Opponent:** {opp_name or opp_tk}")
+        opp_roster = team_roster_raw(sc, opp_tk) or []
+        def _list_to_df(roster_list):
+            rows = []
+            for p in roster_list or []:
+                elig = p.get("eligible_positions") or []
+                if isinstance(elig, list): elig = ",".join(elig)
+                rows.append({
+                    "player_id": p.get("player_id"),
+                    "name": p.get("name"),
+                    "status": p.get("status"),
+                    "eligible_positions": elig or "",
+                    "selected_position": p.get("selected_position"),
+                    "points": (p.get("points") or p.get("proj_points") or 0)
+                })
+            return pd.DataFrame(rows)
+        df_opp = _list_to_df(opp_roster)
+        if df_opp.empty:
+            st.info("Opponent roster not available yet.")
+        else:
+            st.dataframe(df_opp, use_container_width=True)
+
+# ───────────────── Trades (Evaluator) ─────────────────
+with tabs[5]:
     st.subheader("Trade Evaluator")
     st.caption("Pick players to offer/request. Uses current points/projections. For better accuracy, upload projections in Draft Assistant.")
     league = yfa.League(sc, league_key)
@@ -1346,7 +1446,7 @@ with tabs[4]:
                 st.warning(f"OpenAI not available: {e}")
 
 # ───────────────── Opponent Scouting (tab) ─────────────────
-with tabs[4]:
+with tabs[7]:
     st.subheader("Opponent Scouting")
 
     # --- helper: find current opponent (this week) ---
@@ -1572,10 +1672,8 @@ with tabs[4]:
                 except Exception as e:
                     st.error(f"Execution error: {e}")
 
-
-
 # ───────────────── AI Assistant (RAG-lite) ─────────────────
-with tabs[5]:
+with tabs[6]:
     st.subheader("AI Assistant (snapshot → summarize → retrieve → answer)")
     wk_guess = league_current_week(settings or {})
     wk = st.number_input("Week to snapshot", min_value=1, max_value=25, value=wk_guess, step=1)
@@ -1748,7 +1846,7 @@ STYLE:
             st.info("Take a snapshot first to build context.")
 
 # ───────────────── Scheduler / Automation ─────────────────
-with tabs[6]:
+with tabs[8]:
     st.subheader("Scheduler / Automation")
     st.caption("These preferences can be read by a cron/Lambda/Cloud Run task to automate Morning Brief, lineup checks, and waivers.")
     prefs = {"auto_lineup": False, "auto_waivers": False, "waiver_budget_cap": 25, "aggression": 0.15}
@@ -1800,7 +1898,7 @@ def read_logs_local(days: int = 30, limit: int = 2000) -> List[Dict[str, Any]]:
     rows.sort(key=lambda r: r.get("ts",""), reverse=True)
     return rows[:limit]
 
-with tabs[7]:
+with tabs[9]:
     st.subheader("Logs")
 
     kinds_all = ["ai.qa", "snapshot", "waiver.approved", "lineup.reco"]
