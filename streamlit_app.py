@@ -997,7 +997,21 @@ with st.expander("League info", expanded=False):
         "waiver_type": settings.get("waiver_type"),
         "faab_budget": settings.get("faab_budget"),
     })
+    
+# ───────────────── Team mapping cache ─────────────────
+if "team_key" not in st.session_state:
+    st.session_state["team_key"] = None
 
+if draft_status in ("postdraft","inseason"):
+    # try to resolve and cache once per league selection
+    resolved_team = resolve_team_key(sc, league_key)
+    if resolved_team:
+        if st.session_state.get("team_key") != resolved_team:
+            st.session_state["team_key"] = resolved_team
+        st.success(f"✅ Team mapped: {resolved_team}")
+    else:
+        st.warning("⚠️ Could not map a team for this league yet. If you just finished your draft, try re-authenticating or refresh in a few minutes.")
+team_key = st.session_state.get("team_key")
 # Pre-draft gate
 empty_reasons = []
 if not settings:
