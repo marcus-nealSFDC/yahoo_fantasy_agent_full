@@ -110,31 +110,60 @@ def get_session() -> OAuth2:
     return sc
 
 # ───────────────── HTTP helper (diagnostics) ─────────────────
-def yfs_get(sc, path):
+def yfs_get(sc, path, *, max_retries: int = 3):
+    """
+    GET Yahoo Fantasy v2 with JSON accept header, friendly UA, and retry on throttle.
+    Retries on 999/429/502/503 with exponential backoff.
+    """
+    import math, random
+
     url = "https://fantasysports.yahooapis.com/fantasy/v2" + path
-    r = sc.session.get(url, headers={"Accept": "application/json"}, timeout=30)
+    headers = {
+        "Accept": "application/json",
+        # A polite UA helps in some edge cases; keep it short and non-misleading
+        "User-Agent": "yahoo-fantasy-agent/1.0 (+streamlit)",
+    }
 
-    if show_raw:
-        with st.expander(f"HTTP debug: {path}", expanded=True):
-            st.write({"url": url, "status_code": r.status_code, "content_type": r.headers.get("Content-Type", "")})
-            st.code((r.text or "")[:1500])
+    last_err_txt = None
+    for attempt in range(max_retries + 1):
+        r = sc.session.get(url, headers=headers, timeout=30)
 
-    if r.status_code == 401:
-        raise RuntimeError("401 Unauthorized: token invalid/expired or scope missing. Click Connect again.")
-    if r.status_code == 403:
-        raise RuntimeError("403 Forbidden: app not authorized for Fantasy scope or account lacks access.")
-    if r.status_code >= 400:
-        raise RuntimeError(f"{r.status_code} error from Yahoo: {r.text[:200]}")
+        if show_raw:
+            with st.expander(f"HTTP debug: {path}", expanded=True):
+                st.write({"url": url, "status_code": r.status_code, "content_type": r.headers.get("Content-Type", "")})
+                st.code((r.text or "")[:1500])
 
-    body = (r.text or "").strip()
-    if not body:
-        raise RuntimeError("Empty response from Yahoo (no body).")
+        # OK path
+        if 200 <= r.status_code < 300:
+            body = (r.text or "").strip()
+            if not body:
+                raise RuntimeError("Empty response from Yahoo (no body).")
+            try:
+                return r.json()
+            except Exception:
+                ct = r.headers.get("Content-Type", "")
+                raise RuntimeError(f"Non-JSON response ({r.status_code}, {ct}). First 400 chars: {body[:400]}")
 
-    try:
-        return r.json()
-    except Exception:
-        ct = r.headers.get("Content-Type", "")
-        raise RuntimeError(f"Non-JSON response ({r.status_code}, {ct}). First 400 chars: {body[:400]}")
+        # Hard auth errors → no retry
+        if r.status_code == 401:
+            raise RuntimeError("401 Unauthorized: token invalid/expired or scope missing. Click Connect again.")
+        if r.status_code == 403:
+            raise RuntimeError("403 Forbidden: app not authorized for Fantasy scope or account lacks access.")
+
+        # Throttle / transient → retry with backoff
+        if r.status_code in (999, 429, 502, 503):
+            last_err_txt = (r.text or "")[:200]
+            if attempt < max_retries:
+                # exponential backoff with jitter: 0.75s, 1.5s, 3.0s (approx)
+                delay = (0.75 * (2 ** attempt)) * (0.8 + 0.4 * random.random())
+                time.sleep(delay)
+                continue
+            else:
+                raise RuntimeError(f"{r.status_code} error from Yahoo (after retries): {last_err_txt}")
+
+        # Other 4xx/5xx → fail fast
+        raise RuntimeError(f"{r.status_code} error from Yahoo: {(r.text or '')[:200]}")
+
 
 # ─────────────── Parse users→games→leagues (numeric keys) ───────────────
 def parse_games_leagues_v2(raw):
