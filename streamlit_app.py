@@ -1165,7 +1165,6 @@ def lineup_change_deltas(current_df: pd.DataFrame, picks: list[tuple[str, pd.Ser
     benched = list(now_starters - want)  # players to bench
     return gained, benched
 
-
 # ───────────────── Start/Sit (Optimizer v1.5 + optional signals) ─────────────────
 with tabs[2]:
     st.subheader("Recommended Starters (optimizer v1.5)")
