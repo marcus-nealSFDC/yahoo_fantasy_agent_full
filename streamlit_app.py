@@ -1135,16 +1135,36 @@ with tabs[1]:
         st.dataframe(df_roster, use_container_width=True)
 
 # ───── shared helper for lineup deltas (moved to module scope) ─────
-def lineup_change_deltas(current_df: pd.DataFrame, picks: list[tuple[str,pd.Series]]):
-    want = set([p["player_id"] for _, p in picks])
+def lineup_change_deltas(current_df: pd.DataFrame, picks: list[tuple[str, pd.Series]]):
+    """
+    Compare current starters vs optimizer picks.
+    Returns (gained_ids, benched_ids), both as lists of str(player_id).
+    """
+    # Safe DF
+    df = current_df if isinstance(current_df, pd.DataFrame) else pd.DataFrame()
+
+    # Normalize desired starters from picks
+    want = set()
+    for _, p in (picks or []):
+        try:
+            want.add(str(p.get("player_id")))
+        except Exception:
+            # If p is a Series, p["player_id"] works; if dict-like, use .get above
+            pid = p["player_id"] if isinstance(p, pd.Series) else p.get("player_id")
+            if pid is not None:
+                want.add(str(pid))
+
+    # Current starters (exclude BN/IR/NA/empty)
     now_starters = set()
-    for _, r in (current_df or pd.DataFrame()).iterrows():
-        sel = (r.get("selected_position") or "").upper()
-        if sel and sel not in ("BN","IR","NA",""):
-            now_starters.add(r["player_id"])
-    gained = list(want - now_starters)
-    benched = list(now_starters - want)
+    for _, r in df.iterrows():
+        sel = str(r.get("selected_position") or "").upper()
+        if sel and sel not in ("BN", "IR", "NA"):
+            now_starters.add(str(r.get("player_id")))
+
+    gained = list(want - now_starters)   # players to promote
+    benched = list(now_starters - want)  # players to bench
     return gained, benched
+
 
 # ───────────────── Start/Sit (Optimizer v1.5 + optional signals) ─────────────────
 with tabs[2]:
