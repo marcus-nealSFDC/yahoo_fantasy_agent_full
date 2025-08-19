@@ -263,17 +263,16 @@ def resolve_team_key(sc, league_key: str):
     """Return your team_key in a league; logs attempts for clarity."""
     L = None
     try:
+        # yahoo_fantasy_api.League may call settings() in __init__; this can 403/deny.
         L = yfa.League(sc, league_key)
     except Exception as e:
-        st.caption(f"resolve_team_key: League init failed, falling back to /users teams. ({e})")
+        st.caption(f"resolve_team_key: League init failed ({e}); falling back to /users teams")
 
-    # Try library first (only if League init worked)
+    # Try library first (only if League constructed)
     if L is not None:
         try:
-            teams = L.teams()
-            st.caption("resolve_team_key: L.teams() returned "
-                       + (str(len(teams)) if hasattr(teams, "__len__") else "unknown length"))
-
+            teams = L.teams() or []
+            st.caption("resolve_team_key: L.teams() returned " + str(len(teams)))
             def extract(entry):
                 if isinstance(entry, dict):
                     return entry.get("team_key"), entry.get("is_owned_by_current_login"), entry.get("name")
@@ -281,12 +280,13 @@ def resolve_team_key(sc, league_key: str):
                     tk = owned = name = None
                     for kv in entry:
                         if isinstance(kv, dict):
-                            if tk is None and "team_key" in kv: tk = kv["team_key"]
-                            if owned is None and "is_owned_by_current_login" in kv: owned = kv["is_owned_by_current_login"]
-                            if name is None and "name" in kv: name = kv["name"]
+                            tk = tk or kv.get("team_key")
+                            owned = owned if owned is not None else kv.get("is_owned_by_current_login")
+                            name = name or kv.get("name")
                     return tk, owned, name
                 return None, None, None
 
+            # Prefer teams owned by current login, else first
             for t in teams:
                 tk, owned, name = extract(t)
                 if owned in (1, True, "1") and tk:
@@ -300,8 +300,46 @@ def resolve_team_key(sc, league_key: str):
         except Exception as e:
             st.caption(f"resolve_team_key: L.teams() failed: {e}")
 
-    # Fallback via /users;use_login=_
+    # Fallback via /users;use_login=1/teams
+    try:
+        data = yfs_get(sc, "/users;use_login=1/teams?format=json")
+        fc = (data or {}).get("fantasy_content", {})
+        users = fc.get("users", {})
+        user_arr = users.get("user") if "user" in users else None
+        if not user_arr:
+            for k, v in users.items():
+                if str(k).isdigit() and isinstance(v, dict) and "user" in v:
+                    user_arr = v["user"]; break
+        if user_arr:
+            teams_container = None
+            for entry in user_arr:
+                if isinstance(entry, dict) and "teams" in entry:
+                    teams_container = entry["teams"]; break
+            if teams_container:
+                for _, twrap in teams_container.items():
+                    if not isinstance(twrap, dict): continue
+                    tlist = twrap.get("team")
+                    if not isinstance(tlist, list): continue
+                    tk = None; name = None
+                    for el in tlist:
+                        if isinstance(el, dict):
+                            tk = el.get("team_key", tk)
+                            name = el.get("name", name)
+                        elif isinstance(el, list):
+                            for kv in el:
+                                if isinstance(kv, dict):
+                                    tk = kv.get("team_key", tk)
+                                    name = kv.get("name", name)
+                    if tk and tk.startswith(league_key + ".t."):
+                        st.caption(f"resolve_team_key: matched via /users teams → {name} ({tk})")
+                        return tk
+        st.caption("resolve_team_key: no match in /users;use_login=1/teams")
+    except Exception as e:
+        st.caption(f"resolve_team_key: users/teams fallback failed: {e}")
 
+    return None
+
+ # Fallback via /users;use_login=_
 
 def roster_df(sc, league_key: str) -> pd.DataFrame:
     team_key = resolve_team_key(sc, league_key)
@@ -1047,7 +1085,8 @@ st.subheader("🤖 Autopilot")
 league = yfa.League(sc, league_key)
 
 # league_id is a property, not a callable
-league_id = str(getattr(league, "league_id", league_key))  # fallback to league_key if needed
+# Use the selected Yahoo league_key as the stable ID for state files.
+league_id = league_key
 state = load_state(league_id)
 
 state = load_state(league_id)
@@ -1393,26 +1432,26 @@ with tab_roster:
         st.dataframe(df_roster, use_container_width=True)
 
 # ───── shared helper for lineup deltas (moved to module scope) ─────
-def lineup_change_deltas(current_df: pd.DataFrame, picks: list[tuple[str, pd.Series]]):
+def lineup_change_deltas(current_df: pd.DataFrame | None,
+                         picks: list[tuple[str, pd.Series | dict]]):
     """
     Compare current starters vs optimizer picks.
-    Returns (gained_ids, benched_ids) as lists of str(player_id).
+    Returns (gained_ids, benched_ids).
     """
-    # Normalize desired starters from picks
+    # Gather desired starter ids from picks
     want = set()
     for _, p in (picks or []):
-        try:
-            # handle dict-like or pandas Series
-            pid = p.get("player_id") if hasattr(p, "get") else p["player_id"]
-            if pid is not None:
-                want.add(str(pid))
-        except Exception:
-            continue
+        if isinstance(p, pd.Series):
+            pid = p.get("player_id") or p.get("id")
+        elif isinstance(p, dict):
+            pid = p.get("player_id") or p.get("id")
+        else:
+            pid = None
+        if pid is not None:
+            want.add(str(pid))
 
-    # Safe DF (avoid boolean coercion of DataFrame)
+    # Iterate current starters safely (no DataFrame truthiness!)
     df = current_df if isinstance(current_df, pd.DataFrame) else pd.DataFrame()
-
-    # Current starters (exclude BN/IR/NA/empty)
     now_starters = set()
     for _, r in df.iterrows():
         sel = str((r.get("selected_position") if hasattr(r, "get") else r["selected_position"]) or "").upper()
@@ -1421,9 +1460,7 @@ def lineup_change_deltas(current_df: pd.DataFrame, picks: list[tuple[str, pd.Ser
             if pid is not None:
                 now_starters.add(str(pid))
 
-    gained = list(want - now_starters)   # players to promote
-    benched = list(now_starters - want)  # players to bench
-    return gained, benched
+    return list(want - now_starters), list(now_starters - want)
 
 
 # ───────────────── Start/Sit (Optimizer v1.5 + optional signals) ─────────────────
