@@ -1028,6 +1028,29 @@ if draft_status in ("postdraft","inseason"):
     else:
         st.warning("⚠️ Could not map a team for this league yet. If you just finished your draft, try re-authenticating or refresh in a few minutes.")
 team_key = st.session_state.get("team_key")
+# ───────────────── Quick Snapshot (always available) ─────────────────
+st.markdown("### Quick Snapshot")
+wk_guess = league_current_week(settings or {})
+wk_input_cols = st.columns([1,1,2])
+with wk_input_cols[0]:
+    wk = st.number_input("Week", min_value=1, max_value=25, value=int(wk_guess or 1), step=1)
+with wk_input_cols[1]:
+    if st.button("📸 Snapshot league data now", key="snap_always"):
+        try:
+            meta = snapshot_now(sc, league_key, settings, week_override=int(wk))
+            st.session_state["_last_snapshot_meta"] = meta
+            st.success(f"Snapshot saved under: {meta['dir']}")
+            st.json(meta)
+        except Exception as e:
+            st.error(f"Snapshot failed: {e}")
+
+# If a snapshot exists, show where it lives (handy visual)
+if "_last_snapshot_meta" in st.session_state:
+    meta = st.session_state["_last_snapshot_meta"]
+    with st.expander("Latest snapshot meta"):
+        st.json(meta)
+
+
 # Pre-draft gate
 empty_reasons = []
 if not settings:
@@ -1309,7 +1332,8 @@ if st.button("Approve & Execute Plan"):
 
 
 # PRE-DRAFT → Draft Assistant only
-if draft_status != "postdraft":
+# Allow both postdraft and inseason to pass through
+if draft_status not in ("postdraft", "inseason"):
     st.info("📝 **Pre-draft** detected. Roster, Start/Sit, Waivers, Trades, and Scheduler unlock after your draft.")
     st.subheader("Draft Assistant (Pre-draft)")
     st.caption("Upload projections/ADP CSV. Required: `name`, `position`, `proj_points`. Optional: `team`, `adp`, `ecr`.")
