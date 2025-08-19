@@ -1626,7 +1626,7 @@ with tab_start:
 # ───────────────── Waivers (v2) ─────────────────
 with tab_waivers:
     st.subheader("Waiver targets & Approvals")
-
+    df_ranked = pd.DataFrame()  # ← add this line
     try:
         L = yfa.League(sc, league_key)
         cands = free_agents(L)
@@ -1689,38 +1689,47 @@ with tab_waivers:
 
         st.divider()
         st.write("### Approve & Execute (single claim)")
-        if not df_ranked.empty:
-            idx = st.number_input("Row to add (0-based from table above)", min_value=0, max_value=max(0, len(df_ranked)-1), value=0)
+
+        if df_ranked.empty:
+            st.caption("No ranked waivers available yet. Make sure your roster and free agents are populated.")
+        else:
+            max_idx = max(0, len(df_ranked) - 1)
+            idx = st.number_input("Row to add (0-based from table above)",
+                                min_value=0, max_value=max_idx, value=0)
             pick = df_ranked.iloc[int(idx)]
             drop_pid = st.text_input("Player ID to drop (optional)")
-            default_bid = int(pick.get("suggested_faab", 0))
+            default_bid = int(pick.get("suggested_faab", 0) or 0)
             faab_bid = st.number_input("FAAB bid (optional)", min_value=0, max_value=300, value=default_bid)
 
             if st.button("Approve transaction"):
                 try:
-                    result = execute_add_drop(sc, league_key, add_pid=str(pick["player_id"]),
-                                              drop_pid=drop_pid or None,
-                                              faab_bid=int(faab_bid) if faab_bid else None)
+                    result = execute_add_drop(sc, league_key,
+                                            add_pid=str(pick["player_id"]),
+                                            drop_pid=(drop_pid or None),
+                                            faab_bid=int(faab_bid) if faab_bid else None)
                     if result.get("status") == "ok":
                         st.success("Transaction submitted ✅")
                         st.json(result.get("details"))
+
+                        # log
                         try:
-                            pick_dict = _safe_dict({k: (v.item() if hasattr(v, "item") else v) for k, v in pick.to_dict().items()})
+                            pick_dict = {k: (v.item() if hasattr(v, "item") else v) for k, v in pick.to_dict().items()}
                             log_event("waiver.approved",
-                                     league_key=league_key,
-                                     week=current_week,
-                                     data={
-                                         "add_player": pick_dict,
-                                         "drop_player_id": (drop_pid or None),
-                                         "faab_bid": int(faab_bid) if faab_bid else None,
-                                         "result": _safe_dict(result),
-                                     })
+                                    league_key=league_key,
+                                    week=league_current_week(settings or {}),
+                                    data={
+                                        "add_player": pick_dict,
+                                        "drop_player_id": (drop_pid or None),
+                                        "faab_bid": int(faab_bid) if faab_bid else None,
+                                        "result": _safe_dict(result),
+                                    })
                         except Exception as _e:
                             st.caption(f"Logging (waiver.approved) failed: {_e}")
                     else:
                         st.error("Transaction failed"); st.json(result)
                 except Exception as e:
                     st.error(f"Execution error: {e}")
+
 
 # ───────────────── Opponent (overview) ─────────────────
 with tab_opponent:
