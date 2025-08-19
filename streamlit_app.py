@@ -261,77 +261,47 @@ def filter_latest_nfl_leagues(leagues, games):
 # ───────────────────── Data helpers ─────────────────────
 def resolve_team_key(sc, league_key: str):
     """Return your team_key in a league; logs attempts for clarity."""
-    L = yfa.League(sc, league_key)
-
-    # Try library first
+    L = None
     try:
-        teams = L.teams()
-        st.caption("resolve_team_key: L.teams() returned "
-                   + (str(len(teams)) if hasattr(teams, "__len__") else "unknown length"))
-        def extract(entry):
-            if isinstance(entry, dict):
-                return entry.get("team_key"), entry.get("is_owned_by_current_login"), entry.get("name")
-            if isinstance(entry, list):
-                tk = owned = name = None
-                for kv in entry:
-                    if isinstance(kv, dict):
-                        if tk is None and "team_key" in kv: tk = kv["team_key"]
-                        if owned is None and "is_owned_by_current_login" in kv: owned = kv["is_owned_by_current_login"]
-                        if name is None and "name" in kv: name = kv["name"]
-                return tk, owned, name
-            return None, None, None
-
-        for t in teams:
-            tk, owned, name = extract(t)
-            if owned in (1, True, "1") and tk:
-                st.caption(f"resolve_team_key: picking owned team {name} ({tk})")
-                return tk
-        for t in teams:
-            tk, owned, name = extract(t)
-            if tk:
-                st.caption(f"resolve_team_key: falling back to first team {name} ({tk})")
-                return tk
+        L = yfa.League(sc, league_key)
     except Exception as e:
-        st.caption(f"resolve_team_key: L.teams() failed: {e}")
+        st.caption(f"resolve_team_key: League init failed, falling back to /users teams. ({e})")
 
-    # Fallback via /users;use_login=1/teams
-    try:
-        data = yfs_get(sc, "/users;use_login=1/teams?format=json")
-        fc = (data or {}).get("fantasy_content", {})
-        users = fc.get("users", {})
-        user_arr = users.get("user") if "user" in users else None
-        if not user_arr:
-            for k, v in users.items():
-                if str(k).isdigit() and isinstance(v, dict) and "user" in v:
-                    user_arr = v["user"]; break
-        if user_arr:
-            teams_container = None
-            for entry in user_arr:
-                if isinstance(entry, dict) and "teams" in entry:
-                    teams_container = entry["teams"]; break
-            if teams_container:
-                for _, twrap in teams_container.items():
-                    if not isinstance(twrap, dict): continue
-                    tlist = twrap.get("team")
-                    if not isinstance(tlist, list): continue
-                    tk = None; name = None
-                    for el in tlist:
-                        if isinstance(el, dict):
-                            if "team_key" in el: tk = el["team_key"]
-                            if "name" in el and not name: name = el["name"]
-                        if isinstance(el, list):
-                            for kv in el:
-                                if isinstance(kv, dict):
-                                    if "team_key" in kv: tk = kv["team_key"]
-                                    if "name" in kv and not name: name = kv["name"]
-                    if tk and tk.startswith(league_key + ".t."):
-                        st.caption(f"resolve_team_key: matched via /users teams → {name} ({tk})")
-                        return tk
-        st.caption("resolve_team_key: no match in /users;use_login=1/teams")
-    except Exception as e:
-        st.caption(f"resolve_team_key: users/teams fallback failed: {e}")
+    # Try library first (only if League init worked)
+    if L is not None:
+        try:
+            teams = L.teams()
+            st.caption("resolve_team_key: L.teams() returned "
+                       + (str(len(teams)) if hasattr(teams, "__len__") else "unknown length"))
 
-    return None
+            def extract(entry):
+                if isinstance(entry, dict):
+                    return entry.get("team_key"), entry.get("is_owned_by_current_login"), entry.get("name")
+                if isinstance(entry, list):
+                    tk = owned = name = None
+                    for kv in entry:
+                        if isinstance(kv, dict):
+                            if tk is None and "team_key" in kv: tk = kv["team_key"]
+                            if owned is None and "is_owned_by_current_login" in kv: owned = kv["is_owned_by_current_login"]
+                            if name is None and "name" in kv: name = kv["name"]
+                    return tk, owned, name
+                return None, None, None
+
+            for t in teams:
+                tk, owned, name = extract(t)
+                if owned in (1, True, "1") and tk:
+                    st.caption(f"resolve_team_key: picking owned team {name} ({tk})")
+                    return tk
+            for t in teams:
+                tk, owned, name = extract(t)
+                if tk:
+                    st.caption(f"resolve_team_key: falling back to first team {name} ({tk})")
+                    return tk
+        except Exception as e:
+            st.caption(f"resolve_team_key: L.teams() failed: {e}")
+
+    # Fallback via /users;use_login=_
+
 
 def roster_df(sc, league_key: str) -> pd.DataFrame:
     team_key = resolve_team_key(sc, league_key)
@@ -1073,9 +1043,13 @@ import json
 import pandas as pd
 st.subheader("🤖 Autopilot")
 
-# Support both attribute and (older) callable styles; fall back to league_key
-lid_attr = getattr(league, "league_id", None)
-league_id = str(lid_attr() if callable(lid_attr) else (lid_attr or league_key))
+# ensure a League object exists here (it's fine to instantiate again)
+league = yfa.League(sc, league_key)
+
+# league_id is a property, not a callable
+league_id = str(getattr(league, "league_id", league_key))  # fallback to league_key if needed
+state = load_state(league_id)
+
 state = load_state(league_id)
 policy_dict = state.get("policy", DEFAULT_POLICY.__dict__)
 policy = AutopilotPolicy(**policy_dict)
@@ -1422,32 +1396,35 @@ with tab_roster:
 def lineup_change_deltas(current_df: pd.DataFrame, picks: list[tuple[str, pd.Series]]):
     """
     Compare current starters vs optimizer picks.
-    Returns (gained_ids, benched_ids), both as lists of str(player_id).
+    Returns (gained_ids, benched_ids) as lists of str(player_id).
     """
-    # Safe DF
-    df = current_df if isinstance(current_df, pd.DataFrame) else pd.DataFrame()
-
     # Normalize desired starters from picks
     want = set()
     for _, p in (picks or []):
         try:
-            want.add(str(p.get("player_id")))
-        except Exception:
-            # If p is a Series, p["player_id"] works; if dict-like, use .get above
-            pid = p["player_id"] if isinstance(p, pd.Series) else p.get("player_id")
+            # handle dict-like or pandas Series
+            pid = p.get("player_id") if hasattr(p, "get") else p["player_id"]
             if pid is not None:
                 want.add(str(pid))
+        except Exception:
+            continue
+
+    # Safe DF (avoid boolean coercion of DataFrame)
+    df = current_df if isinstance(current_df, pd.DataFrame) else pd.DataFrame()
 
     # Current starters (exclude BN/IR/NA/empty)
     now_starters = set()
     for _, r in df.iterrows():
-        sel = str(r.get("selected_position") or "").upper()
+        sel = str((r.get("selected_position") if hasattr(r, "get") else r["selected_position"]) or "").upper()
         if sel and sel not in ("BN", "IR", "NA"):
-            now_starters.add(str(r.get("player_id")))
+            pid = r.get("player_id") if hasattr(r, "get") else r["player_id"]
+            if pid is not None:
+                now_starters.add(str(pid))
 
     gained = list(want - now_starters)   # players to promote
     benched = list(now_starters - want)  # players to bench
     return gained, benched
+
 
 # ───────────────── Start/Sit (Optimizer v1.5 + optional signals) ─────────────────
 with tab_start:
