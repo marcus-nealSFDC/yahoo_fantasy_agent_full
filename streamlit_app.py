@@ -18,6 +18,12 @@ from utils.lineup_opt import apply_enrichment, optimize_lineup  # optional enric
 from utils.waivers import rank_waivers, multi_claim_queue       # waiver scoring + queue
 from utils.opponent import scout_weak_spots, recommend_blocks   # opponent scouting
 
+from policy import AutopilotPolicy, DEFAULT_POLICY
+from storage.state import load_state, save_state
+from agent.reasoning import plan_week, plan_start_sit, plan_waivers, plan_trades
+from agent.executor import submit_waiver_queue, set_lineup, send_trade_offer
+
+
 # ───────────────── Setup base dirs & logging ─────────────────
 load_dotenv()
 
@@ -893,6 +899,7 @@ if not nfl_leags:
 league_map = {f"{lg['name']} ({lg['league_key']})": lg["league_key"] for lg in nfl_leags}
 choice = st.selectbox("Select a league", list(league_map.keys()))
 league_key = league_map[choice]
+league = yfa.League(sc, league_key)  # ← EDIT 1: create reusable league object
 
 # Show user teams table to clarify whether a team exists for this league
 def render_user_teams(sc, league_key: str):
@@ -1060,6 +1067,208 @@ if show_raw:
             st.write("**/league/.../teams**:", raw_teams)
         except Exception as e:
             st.error(f"teams error: {e}")
+
+# --- AUTOPILOT PANEL (paste after sc, league, team_key are set) ---
+import json
+import pandas as pd
+st.subheader("🤖 Autopilot")
+
+league_id = str(league.league_id()) if hasattr(league, "league_id") else st.session_state.get("league_key","unknown")
+state = load_state(league_id)
+policy_dict = state.get("policy", DEFAULT_POLICY.__dict__)
+policy = AutopilotPolicy(**policy_dict)
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    policy.autopilot_on = st.toggle("Enable Autopilot", policy.autopilot_on)
+with c2:
+    policy.require_approval = st.toggle("Require Approval", policy.require_approval)
+with c3:
+    policy.max_faab_bid = st.number_input("Max FAAB per player", 0, 100, policy.max_faab_bid)
+policy.approval_threshold_epar = st.slider("Auto-approve if EPAR ≥", 0.0, 5.0, policy.approval_threshold_epar, 0.1)
+policy.variance_style = st.selectbox("Lineup risk style", ["auto","floor","ceiling"], index=["auto","floor","ceiling"].index(policy.variance_style))
+
+state["policy"] = policy.__dict__
+save_state(league_id, state)
+
+# --- Build inputs (swap these stubs with your real helpers) ---
+# --- Build inputs (wired to your utils + Yahoo) ---
+
+def _safe_float(x, default=0.0):
+    try: return float(x)
+    except: return default
+
+def build_roster_view(league: "yfa.League", team_key: str) -> list[dict]:
+    # Use your roster_df helper, then enrich with your signals/scoring if available
+    df = roster_df(sc, league_key)
+    if df.empty:
+        return []
+    try:
+        enriched = apply_enrichment(df.copy(), signals={})  # thread real signals later if you want
+    except Exception:
+        enriched = df.copy()
+
+    # Ensure required columns
+    if "proj_points" not in enriched.columns:
+        enriched["proj_points"] = enriched.get("points", pd.Series([0]*len(enriched))).astype(float)
+    if "floor" not in enriched.columns:
+        enriched["floor"] = enriched["proj_points"] * 0.8
+    if "ceiling" not in enriched.columns:
+        enriched["ceiling"] = enriched["proj_points"] * 1.25
+    if "eligible_positions" not in enriched.columns:
+        enriched["eligible_positions"] = ""
+
+    rows = []
+    for _, r in enriched.iterrows():
+        rows.append({
+            "player_id": str(r.get("player_id")),
+            "player_name": r.get("name"),
+            "pos": (r.get("eligible_positions") or "").split(",")[0] if r.get("eligible_positions") else "",
+            "proj_points": _safe_float(r.get("proj_points")),
+            "floor": _safe_float(r.get("floor")),
+            "ceiling": _safe_float(r.get("ceiling")),
+            "bye": r.get("bye") or None,
+            "injury_status": r.get("status") or "",
+            "tags": {
+                "eligible": r.get("eligible_positions"),
+                "selected": r.get("selected_position"),
+            }
+        })
+    return rows
+
+def build_fa_view(league: "yfa.League", limit: int = 25) -> list[dict]:
+    # Use your free_agents + rank_waivers to produce a shortlist with EPAR
+    try:
+        settings_full = settings or league_settings(sc, league_key)
+        team = roster_df(sc, league_key)
+        pool = free_agents(league, positions=None, limit=limit*3)  # take extra, then trim
+        df_ranked = rank_waivers(pool, team, league_current_week(settings_full), settings_full)
+        if not isinstance(df_ranked, pd.DataFrame) or df_ranked.empty:
+            return []
+        df_ranked = df_ranked.head(limit).copy()
+
+        def _pick_epar(row):
+            for k in ("epar", "EPAR", "epar_3wk", "epar_next", "epar_ros", "points_gain"):
+                if k in row and pd.notnull(row[k]):
+                    return _safe_float(row[k])
+            return 0.0
+
+        out = []
+        for _, r in df_ranked.iterrows():
+            out.append({
+                "player_id": str(r.get("player_id")),
+                "player_name": r.get("name") or r.get("player_name"),
+                "position": (r.get("position") or r.get("pos") or "").upper(),
+                "epar": _pick_epar(r),
+                "availability": "FA/Waivers",
+                "reason": r.get("why") or r.get("notes") or "",
+            })
+        return out
+    except Exception:
+        return []
+
+def build_schedule_view(league: "yfa.League", team_key: str) -> tuple[dict, str]:
+    # Return (schedule_view, opponent_name) for current week
+    wk = league_current_week(settings or {})
+    sb = get_scoreboard(sc, league_key, wk) or {}
+    you_tk = resolve_team_key(sc, league_key)
+    opp_name = "TBD"
+    opp_tk = None
+    try:
+        fc = (sb or {}).get("fantasy_content", {})
+        lg = fc.get("league")
+        scoreboard = lg.get("scoreboard") if isinstance(lg, dict) else None
+        if not scoreboard and isinstance(lg, list):
+            for el in lg:
+                if isinstance(el, dict) and "scoreboard" in el:
+                    scoreboard = el["scoreboard"]; break
+        if scoreboard:
+            ms = scoreboard.get("matchups", {})
+            for _, wrap in ms.items():
+                m = wrap.get("matchup") if isinstance(wrap, dict) else None
+                teams_c = None
+                if isinstance(m, dict): teams_c = m.get("teams")
+                if not teams_c and isinstance(m, list):
+                    for z in m:
+                        if isinstance(z, dict) and "teams" in z:
+                            teams_c = z["teams"]; break
+                if teams_c:
+                    tkeys, tnames = [], []
+                    for _, tw in teams_c.items():
+                        if isinstance(tw, dict) and "team" in tw:
+                            team = tw["team"]
+                            tk = nm = None
+                            if isinstance(team, dict):
+                                tk = team.get("team_key"); nm = team.get("name")
+                            elif isinstance(team, list):
+                                for kv in team:
+                                    if isinstance(kv, dict):
+                                        if "team_key" in kv and not tk: tk = kv["team_key"]
+                                        if "name" in kv and not nm: nm = kv["name"]
+                            if tk:
+                                tkeys.append(tk); tnames.append(nm or tk)
+                    if you_tk and you_tk in tkeys and len(tkeys) == 2:
+                        idx = tkeys.index(you_tk)
+                        opp_tk = tkeys[1-idx]; opp_name = tnames[1-idx]
+    except Exception:
+        pass
+    return ({"week": wk, "opponent_team_key": opp_tk, "opponent_name": opp_name}, opp_name)
+
+def build_injuries_view(league: "yfa.League") -> dict:
+    try:
+        inj = league.injuries()
+        return inj if isinstance(inj, (dict, list)) else {}
+    except Exception:
+        return {}
+
+week = st.session_state.get("week") or 1
+league_rules = {"scoring": "half-ppr"}  # replace with league.settings() if available
+record = "0-0"  # fill from standings if you have it
+schedule_view, opponent_name = build_schedule_view(league, team_key)
+roster_view = build_roster_view(league, team_key)
+fa_view = build_fa_view(league)
+injuries_view = build_injuries_view(league)
+
+if st.button("Generate Weekly AI Plan"):
+    plan = plan_week(
+        week=week,
+        league_rules=league_rules,
+        team_key=team_key,
+        record=record,
+        opponent_name=opponent_name,
+        playoff_weeks=sorted(list(policy.playoff_weeks)),
+        policy=policy.__dict__,
+        roster=roster_view,
+        free_agents=fa_view,
+        schedule=schedule_view,
+        injuries=injuries_view,
+    )
+    st.session_state["pending_plan"] = plan
+    st.success("Weekly plan generated.")
+    with st.expander("View plan JSON"):
+        st.json(plan)
+    if "start_sit" in plan:
+        st.markdown("**Proposed Start/Sit**")
+        st.dataframe(pd.DataFrame(plan["start_sit"].get("moves", [])))
+    if "waivers" in plan:
+        st.markdown("**Waiver Claims**")
+        st.dataframe(pd.DataFrame(plan["waivers"]))
+    if "trades" in plan and plan["trades"]:
+        st.markdown("**Trade Ideas**")
+        st.dataframe(pd.DataFrame(plan["trades"]))
+
+if st.button("Approve & Execute Plan"):
+    plan = st.session_state.get("pending_plan")
+    if not plan:
+        st.warning("Generate a plan first.")
+    else:
+        submit_waiver_queue(sc, league, team_key, plan.get("waivers", []))
+        if "start_sit" in plan:
+            set_lineup(sc, league, team_key, plan["start_sit"])
+        for offer in plan.get("trades", []):
+            send_trade_offer(sc, league, offer)
+        st.success("Draft transactions logged. Swap executor stubs for real Yahoo calls when ready.")
+
 
 # PRE-DRAFT → Draft Assistant only
 if draft_status != "postdraft":
