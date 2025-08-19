@@ -263,16 +263,17 @@ def resolve_team_key(sc, league_key: str):
     """Return your team_key in a league; logs attempts for clarity."""
     L = None
     try:
-        # yahoo_fantasy_api.League may call settings() in __init__; this can 403/deny.
         L = yfa.League(sc, league_key)
     except Exception as e:
-        st.caption(f"resolve_team_key: League init failed ({e}); falling back to /users teams")
+        st.caption(f"resolve_team_key: League init failed, falling back to /users teams. ({e})")
 
-    # Try library first (only if League constructed)
+    # Try library first, if League constructed
     if L is not None:
         try:
-            teams = L.teams() or []
-            st.caption("resolve_team_key: L.teams() returned " + str(len(teams)))
+            teams = L.teams()
+            st.caption("resolve_team_key: L.teams() returned "
+                       + (str(len(teams)) if hasattr(teams, "__len__") else "unknown length"))
+
             def extract(entry):
                 if isinstance(entry, dict):
                     return entry.get("team_key"), entry.get("is_owned_by_current_login"), entry.get("name")
@@ -280,13 +281,12 @@ def resolve_team_key(sc, league_key: str):
                     tk = owned = name = None
                     for kv in entry:
                         if isinstance(kv, dict):
-                            tk = tk or kv.get("team_key")
-                            owned = owned if owned is not None else kv.get("is_owned_by_current_login")
-                            name = name or kv.get("name")
+                            if tk is None and "team_key" in kv: tk = kv["team_key"]
+                            if owned is None and "is_owned_by_current_login" in kv: owned = kv["is_owned_by_current_login"]
+                            if name is None and "name" in kv: name = kv["name"]
                     return tk, owned, name
                 return None, None, None
 
-            # Prefer teams owned by current login, else first
             for t in teams:
                 tk, owned, name = extract(t)
                 if owned in (1, True, "1") and tk:
@@ -323,13 +323,13 @@ def resolve_team_key(sc, league_key: str):
                     tk = None; name = None
                     for el in tlist:
                         if isinstance(el, dict):
-                            tk = el.get("team_key", tk)
-                            name = el.get("name", name)
-                        elif isinstance(el, list):
+                            if "team_key" in el: tk = el["team_key"]
+                            if "name" in el and not name: name = el["name"]
+                        if isinstance(el, list):
                             for kv in el:
                                 if isinstance(kv, dict):
-                                    tk = kv.get("team_key", tk)
-                                    name = kv.get("name", name)
+                                    if "team_key" in kv: tk = kv["team_key"]
+                                    if "name" in kv and not name: name = kv["name"]
                     if tk and tk.startswith(league_key + ".t."):
                         st.caption(f"resolve_team_key: matched via /users teams → {name} ({tk})")
                         return tk
@@ -338,6 +338,7 @@ def resolve_team_key(sc, league_key: str):
         st.caption(f"resolve_team_key: users/teams fallback failed: {e}")
 
     return None
+
 
  # Fallback via /users;use_login=_
 
@@ -1086,10 +1087,24 @@ league = yfa.League(sc, league_key)
 
 # league_id is a property, not a callable
 # Use the selected Yahoo league_key as the stable ID for state files.
-league_id = league_key
-state = load_state(league_id)
+# --- Autopilot ID + state (drop-in replacement) ---
 
-state = load_state(league_id)
+def _league_id_for_state(league_key: str) -> str:
+    """
+    Make a stable, file-safe id from a Yahoo league_key.
+    Example: '423.l.12345' -> '12345'; else fall back to the full key.
+    """
+    if ".l." in league_key:
+        tail = league_key.split(".l.", 1)[1]
+        # if a team suffix exists (e.g., ".t.8"), strip it
+        return tail.split(".", 1)[0]
+    return league_key
+
+league_id = _league_id_for_state(league_key)
+
+state = load_state(league_id) or {}
+
+# Build / edit policy in the UI
 policy_dict = state.get("policy", DEFAULT_POLICY.__dict__)
 policy = AutopilotPolicy(**policy_dict)
 
@@ -1100,11 +1115,19 @@ with c2:
     policy.require_approval = st.toggle("Require Approval", policy.require_approval)
 with c3:
     policy.max_faab_bid = st.number_input("Max FAAB per player", 0, 100, policy.max_faab_bid)
-policy.approval_threshold_epar = st.slider("Auto-approve if EPAR ≥", 0.0, 5.0, policy.approval_threshold_epar, 0.1)
-policy.variance_style = st.selectbox("Lineup risk style", ["auto","floor","ceiling"], index=["auto","floor","ceiling"].index(policy.variance_style))
 
-state["policy"] = policy.__dict__
+policy.approval_threshold_epar = st.slider("Auto-approve if EPAR ≥", 0.0, 5.0, policy.approval_threshold_epar, 0.1)
+policy.variance_style = st.selectbox("Lineup risk style", ["auto","floor","ceiling"],
+                                     index=["auto","floor","ceiling"].index(policy.variance_style))
+
+# IMPORTANT: coerce non-JSON types *before* saving
+safe_policy = dict(policy.__dict__)
+if isinstance(safe_policy.get("playoff_weeks"), set):
+    safe_policy["playoff_weeks"] = sorted(safe_policy["playoff_weeks"])
+
+state["policy"] = safe_policy
 save_state(league_id, state)
+
 
 # --- Build inputs (swap these stubs with your real helpers) ---
 # --- Build inputs (wired to your utils + Yahoo) ---
