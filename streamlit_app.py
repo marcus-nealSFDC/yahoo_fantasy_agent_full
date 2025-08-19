@@ -1073,7 +1073,9 @@ import json
 import pandas as pd
 st.subheader("🤖 Autopilot")
 
-league_id = str(league.league_id()) if hasattr(league, "league_id") else st.session_state.get("league_key","unknown")
+# Support both attribute and (older) callable styles; fall back to league_key
+lid_attr = getattr(league, "league_id", None)
+league_id = str(lid_attr() if callable(lid_attr) else (lid_attr or league_key))
 state = load_state(league_id)
 policy_dict = state.get("policy", DEFAULT_POLICY.__dict__)
 policy = AutopilotPolicy(**policy_dict)
