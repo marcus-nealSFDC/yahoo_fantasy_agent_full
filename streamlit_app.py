@@ -2161,6 +2161,55 @@ with tab_ai:
                     st.caption(f"Snapshot logging failed: {_e}")
             except Exception as e:
                 st.error(f"Snapshot failed: {e}")
+            # ───────────────── Manual Opponent Override (optional) ─────────────────
+    with st.expander("Manual opponent override", expanded=False):
+        try:
+            L = yfa.League(sc, league_key)
+            you_tk = resolve_team_key(sc, league_key)
+
+            # Build name -> team_key map (exclude your team)
+            teams = []
+            for t in L.teams() or []:
+                tk = nm = None
+                if isinstance(t, dict):
+                    tk = t.get("team_key"); nm = t.get("name") or tk
+                elif isinstance(t, list):
+                    for kv in t:
+                        if isinstance(kv, dict):
+                            if "team_key" in kv and not tk: tk = kv["team_key"]
+                            if "name" in kv and not nm: nm = kv["name"]
+                if tk: teams.append({"team_key": tk, "name": nm or tk})
+
+            opts = {t["name"]: t["team_key"] for t in teams if t["team_key"] != you_tk}
+            if not opts:
+                st.caption("No other teams listed yet.")
+            else:
+                pick_name = st.selectbox(
+                    "Pick opponent (temporary until Yahoo posts the scoreboard)",
+                    list(opts.keys()),
+                    key="opp_override_pick",
+                )
+                if st.button("Set opponent for current snapshot", key="opp_override_btn"):
+                    if "_last_snapshot_meta" not in st.session_state:
+                        st.warning("Take a snapshot first.")
+                    else:
+                        meta = st.session_state["_last_snapshot_meta"]
+                        opp_tk = opts[pick_name]
+                        opp_roster = team_roster_raw(sc, opp_tk)
+
+                        # write opp roster and update meta
+                        league_dir = Path(meta["dir"])
+                        (league_dir / "opp_roster.json").write_text(json.dumps(opp_roster, indent=2))
+                        meta["opp_team_key"] = opp_tk
+                        meta["opp_team_name"] = pick_name
+                        st.session_state["_last_snapshot_meta"] = meta
+
+                        # refresh Morning Brief to include the opponent
+                        write_morning_brief(sc, league_key, meta)
+
+                        st.success(f"Opponent set to {pick_name} ({opp_tk}). Morning Brief refreshed.")
+        except Exception as e:
+            st.caption(f"Manual opponent override unavailable: {e}")
 
         # Optional: quick reminder if no snapshot yet
         if "_last_snapshot_meta" not in st.session_state:
@@ -2290,22 +2339,26 @@ STYLE:
 
     # After a snapshot exists, show summaries + Q&A
     with col_b:
-        st.markdown("#### Step 2 — Ask Questions")
-        meta = st.session_state.get("_last_snapshot_meta")
-        if not meta:
-            st.caption("Once a snapshot exists, you’ll see summaries here and can ask questions.")
-        else:
-            st.caption(f"Using snapshot dir: {meta['dir']}")
-            try:
-                summaries = build_context_summaries(meta)
-            except Exception as e:
-                summaries = []
-                st.warning(f"Could not build context summaries: {e}")
+        try:
+            st.markdown("#### Step 2 — Ask Questions")
+            meta = st.session_state.get("_last_snapshot_meta")
+
+            # Quick visibility aid
+            st.caption(f"Snapshot meta loaded: {'yes' if meta else 'no'}")
+
+            summaries = []
+            if meta:
+                try:
+                    summaries = build_context_summaries(meta)
+                except Exception as e:
+                    st.warning(f"Could not build context summaries: {e}")
 
             if summaries:
                 st.write("**Context summaries (top of mind):**")
                 for s in summaries:
                     st.write("- " + str(s))
+            else:
+                st.caption("No summaries yet. You can still ask a question; I’ll answer with minimal context.")
 
             q = st.text_area(
                 "Ask a question (e.g., 'Who should I flex in PPR this week?' or 'What are my opponent’s weak spots?')",
@@ -2315,26 +2368,23 @@ STYLE:
             k_ctx = st.slider("How much context to feed the model", 1, 5, 3)
 
             if st.button("🤖 Ask AI", key="ask_ai"):
-                if not summaries:
-                    st.warning("Take a snapshot first.")
-                else:
-                    try:
-                        chosen = select_context(q or "", summaries, k=int(k_ctx))
-                        structured = {
-                            "league_key": league_key,
-                            "week": meta.get("week"),
-                            "you_team_key": meta.get("you_team_key"),
-                            "opp_team_key": meta.get("opp_team_key"),
-                            "timestamp": datetime.utcnow().isoformat() + "Z",
-                        }
-                        ans = answer_with_ai(q or "Give me a weekly plan.", chosen, structured,
-                                             league_key=league_key, mode="assistant")
-                        st.markdown("### Answer")
-                        st.write(ans)
-                        with st.expander("Context used"):
-                            st.write(chosen)
-                    except Exception as e:
-                        st.error(f"AI answer failed: {e}")
+                chosen = (summaries or ["(no context summaries available)"])[: int(k_ctx)]
+                structured = {
+                    "league_key": league_key,
+                    "week": (meta or {}).get("week"),
+                    "you_team_key": (meta or {}).get("you_team_key"),
+                    "opp_team_key": (meta or {}).get("opp_team_key"),
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                }
+                ans = answer_with_ai(q or "Give me a weekly plan.", chosen, structured,
+                                    league_key=league_key, mode="assistant")
+                st.markdown("### Answer")
+                st.write(ans)
+                with st.expander("Context used"):
+                    st.write(chosen)
+        except Exception as e:
+            st.error(f"AI column error: {e}")
+
 
     # Tiny helper: if OpenAI isn’t configured, warn (doesn’t block snapshots)
     if not OPENAI_OK:
